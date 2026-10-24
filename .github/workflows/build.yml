@@ -1,73 +1,29 @@
-name: build
-
-# Самодостаточный workflow: весь код мода встроен в этот файл.
-# Положите его в .github/workflows/build.yml пустого репозитория и запустите (Actions -> build -> Run workflow).
-#
-# Этап 2: режим правки раскладки (хоткей G):
-#   - все слоты мигают, обычным инвентарём пользоваться нельзя;
-#   - Shift + зацепить правый край мышкой и тянуть вправо = добавлять вертикальные колонки (3 слота инвентаря + 1 хотбара);
-#   - ПКМ по добавленному слоту = удалить слот (ПКМ по удалённому = вернуть);
-#   - ЛКМ = подтвердить (сервер проверяет и подтверждает); Esc = отмена.
-# Реальные слоты в инвентаре (миксины) появятся на этапе 3, для него нужен артефакт mc-sources (галочка inspect).
+name: Build Big Bag
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
   workflow_dispatch:
-    inputs:
-      inspect:
-        description: 'Выгрузить исходники Minecraft (нужно для миксинов)'
-        type: boolean
-        default: true
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 25
+          java-version: '25'
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 9.7.0
+          gradle-version: '9.5.1'
 
-      - name: Generate mod project
+      - name: Create project files
         run: |
-          cat > 'gradle.properties' <<'BIGINV_EOF'
-          org.gradle.jvmargs=-Xmx2G
-          org.gradle.parallel=true
-          org.gradle.configuration-cache=false
-
-          # Fabric (https://fabricmc.net/develop)
-          minecraft_version=26.2
-          loader_version=0.19.5
-          loom_version=1.18.4
-          fabric_api_version=0.161.0+26.2
-
-          # Мод
-          mod_version=0.2.0
-          maven_group=com.biginventory
-          archives_base_name=biginventory
-          BIGINV_EOF
-          cat > 'settings.gradle' <<'BIGINV_EOF'
-          pluginManagement {
-              repositories {
-                  maven {
-                      name = 'Fabric'
-                      url = 'https://maven.fabricmc.net/'
-                  }
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          BIGINV_EOF
-          cat > 'build.gradle' <<'BIGINV_EOF'
+          cat > build.gradle <<'EOF'
           plugins {
               id 'net.fabricmc.fabric-loom' version "${loom_version}"
               id 'maven-publish'
@@ -81,29 +37,17 @@ jobs:
           }
 
           repositories {
-          }
-
-          loom {
-              splitEnvironmentSourceSets()
-
-              mods {
-                  "biginventory" {
-                      sourceSet sourceSets.main
-                      sourceSet sourceSets.client
-                  }
-              }
+              mavenCentral()
           }
 
           dependencies {
-              // Minecraft 26.x не обфусцирован: маппинги и remap не нужны
               minecraft "com.mojang:minecraft:${project.minecraft_version}"
               implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
           }
 
           processResources {
               inputs.property "version", project.version
-
               filesMatching("fabric.mod.json") {
                   expand "version": inputs.properties.version
               }
@@ -111,467 +55,521 @@ jobs:
 
           tasks.withType(JavaCompile).configureEach {
               it.options.release = 25
-              it.options.encoding = "UTF-8"
+              it.options.encoding = 'UTF-8'
           }
 
           java {
-              withSourcesJar()
               sourceCompatibility = JavaVersion.VERSION_25
               targetCompatibility = JavaVersion.VERSION_25
           }
-          BIGINV_EOF
-          mkdir -p 'src/main/java/com/biginventory'
-          cat > 'src/main/java/com/biginventory/BigInventory.java' <<'BIGINV_EOF'
-          package com.biginventory;
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3G
+          org.gradle.parallel=true
+          minecraft_version=26.2
+          loader_version=0.19.3
+          loom_version=1.17-SNAPSHOT
+          fabric_version=0.152.1+26.2
+          mod_version=0.1.0
+          maven_group=com.bigbag
+          archives_base_name=bigbag
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'bigbag'
+          EOF
+
+          mkdir -p src/main/java/com/bigbag
+          cat > src/main/java/com/bigbag/BagData.java <<'EOF'
+          package com.bigbag;
+
+          import com.mojang.serialization.Codec;
+          import com.mojang.serialization.codecs.RecordCodecBuilder;
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.world.item.ItemStack;
+
+          /** Immutable per-player data: contents of the extra slots and a bitmask of unlocked slots. */
+          public record BagData(List<ItemStack> items, long unlocked) {
+              public static final int SIZE = 54;
+              /** How many extra slots a new player starts with (first 27 = 3 rows). */
+              public static final long DEFAULT_UNLOCKED = (1L << 27) - 1L;
+
+              public static final Codec<BagData> CODEC = RecordCodecBuilder.create(i -> i.group(
+                      ItemStack.OPTIONAL_CODEC.listOf().fieldOf("items").forGetter(BagData::items),
+                      Codec.LONG.fieldOf("unlocked").forGetter(BagData::unlocked)
+              ).apply(i, BagData::new));
+
+              public static BagData empty() {
+                  List<ItemStack> list = new ArrayList<>(SIZE);
+                  for (int k = 0; k < SIZE; k++) {
+                      list.add(ItemStack.EMPTY);
+                  }
+                  return new BagData(list, DEFAULT_UNLOCKED);
+              }
+          }
+          EOF
+
+          mkdir -p src/main/java/com/bigbag
+          cat > src/main/java/com/bigbag/BagMenu.java <<'EOF'
+          package com.bigbag;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.Container;
+          import net.minecraft.world.SimpleContainer;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.AbstractContainerMenu;
+          import net.minecraft.world.inventory.SimpleContainerData;
+          import net.minecraft.world.inventory.Slot;
+          import net.minecraft.world.item.ItemStack;
+
+          public class BagMenu extends AbstractContainerMenu {
+              public static final int SIZE = BagData.SIZE;
+              public static final int COLS = 9;
+              private static final int PLAYER_SLOTS = 36;
+
+              private final SimpleContainer container = new SimpleContainer(SIZE);
+              /** 1 = slot unlocked, 0 = locked. Synced to the client automatically as menu data. */
+              private final SimpleContainerData unlocked = new SimpleContainerData(SIZE);
+              /** null on the client. */
+              private final ServerPlayer owner;
+
+              // Client-side constructor
+              public BagMenu(int containerId, Inventory inventory) {
+                  this(containerId, inventory, null);
+              }
+
+              // Server-side constructor
+              public BagMenu(int containerId, Inventory inventory, ServerPlayer owner) {
+                  super(BigBagMod.BAG_MENU, containerId);
+                  this.owner = owner;
+
+                  if (owner != null) {
+                      BagData data = owner.getAttachedOrCreate(BigBagMod.BAG_DATA);
+                      for (int i = 0; i < SIZE; i++) {
+                          ItemStack stack = i < data.items().size() ? data.items().get(i) : ItemStack.EMPTY;
+                          this.container.setItem(i, stack.copy());
+                          this.unlocked.set(i, ((data.unlocked() >> i) & 1L) == 1L ? 1 : 0);
+                      }
+                      this.container.addListener(c -> this.save());
+                  }
+
+                  for (int row = 0; row < SIZE / COLS; row++) {
+                      for (int col = 0; col < COLS; col++) {
+                          int idx = row * COLS + col;
+                          this.addSlot(new BagSlot(this.container, idx, 8 + col * 18, 18 + row * 18, this));
+                      }
+                  }
+                  this.addStandardInventorySlots(inventory, 8, 140);
+                  this.addDataSlots(this.unlocked);
+              }
+
+              public boolean isUnlocked(int index) {
+                  return index >= 0 && index < SIZE && this.unlocked.get(index) == 1;
+              }
+
+              /** Server only: unlock or remove one slot. Items in a removed slot are dropped. */
+              public void setUnlocked(int index, boolean on) {
+                  if (this.owner == null || index < 0 || index >= SIZE) {
+                      return;
+                  }
+                  if (isUnlocked(index) == on) {
+                      return;
+                  }
+                  if (!on) {
+                      ItemStack stack = this.container.getItem(index);
+                      if (!stack.isEmpty()) {
+                          this.container.setItem(index, ItemStack.EMPTY);
+                          this.owner.drop(stack, false);
+                      }
+                  }
+                  this.unlocked.set(index, on ? 1 : 0);
+                  save();
+              }
+
+              private void save() {
+                  if (this.owner == null) {
+                      return;
+                  }
+                  List<ItemStack> list = new ArrayList<>(SIZE);
+                  long mask = 0L;
+                  for (int i = 0; i < SIZE; i++) {
+                      list.add(this.container.getItem(i).copy());
+                      if (this.unlocked.get(i) == 1) {
+                          mask |= 1L << i;
+                      }
+                  }
+                  this.owner.setAttached(BigBagMod.BAG_DATA, new BagData(list, mask));
+              }
+
+              @Override
+              public ItemStack quickMoveStack(Player player, int slotIndex) {
+                  Slot slot = this.slots.get(slotIndex);
+                  if (!slot.hasItem()) {
+                      return ItemStack.EMPTY;
+                  }
+                  ItemStack stack = slot.getItem();
+                  ItemStack clicked = stack.copy();
+
+                  if (slotIndex < SIZE) {
+                      if (!this.moveItemStackTo(stack, SIZE, SIZE + PLAYER_SLOTS, true)) {
+                          return ItemStack.EMPTY;
+                      }
+                  } else {
+                      if (!this.moveItemStackTo(stack, 0, SIZE, false)) {
+                          return ItemStack.EMPTY;
+                      }
+                  }
+
+                  if (stack.isEmpty()) {
+                      slot.setByPlayer(ItemStack.EMPTY);
+                  } else {
+                      slot.setChanged();
+                  }
+                  return clicked;
+              }
+
+              @Override
+              public boolean stillValid(Player player) {
+                  return true;
+              }
+
+              private static class BagSlot extends Slot {
+                  private final BagMenu menu;
+                  private final int index;
+
+                  BagSlot(Container container, int index, int x, int y, BagMenu menu) {
+                      super(container, index, x, y);
+                      this.menu = menu;
+                      this.index = index;
+                  }
+
+                  @Override
+                  public boolean mayPlace(ItemStack stack) {
+                      return this.menu.isUnlocked(this.index);
+                  }
+
+                  @Override
+                  public boolean mayPickup(Player player) {
+                      return this.menu.isUnlocked(this.index);
+                  }
+              }
+          }
+          EOF
+
+          mkdir -p src/main/java/com/bigbag
+          cat > src/main/java/com/bigbag/BigBagMod.java <<'EOF'
+          package com.bigbag;
 
           import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry;
+          import net.fabricmc.fabric.api.attachment.v1.AttachmentType;
           import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.core.Registry;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.network.chat.Component;
           import net.minecraft.resources.Identifier;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.SimpleMenuProvider;
+          import net.minecraft.world.flag.FeatureFlagSet;
+          import net.minecraft.world.inventory.MenuType;
 
-          public class BigInventory implements ModInitializer {
-              public static final String MOD_ID = "biginventory";
-
-              /** Максимум дополнительных колонок. */
-              public static final int MAX_COLUMNS = 6;
-
-              /** В одной колонке: 3 слота инвентаря + 1 слот хотбара. */
-              public static final int ROWS = 4;
+          public class BigBagMod implements ModInitializer {
+              public static final String MOD_ID = "bigbag";
 
               public static Identifier id(String path) {
                   return Identifier.fromNamespaceAndPath(MOD_ID, path);
               }
 
-              /** Битовая маска, в которой единицы стоят на всех существующих добавленных слотах (до 24 бит). */
-              public static int validMask(int columns) {
-                  int slots = Math.max(0, Math.min(MAX_COLUMNS, columns)) * ROWS;
-                  return (1 << slots) - 1;
-              }
+              public static final AttachmentType<BagData> BAG_DATA = AttachmentRegistry.create(
+                      id("bag"),
+                      builder -> builder
+                              .initializer(BagData::empty)
+                              .persistent(BagData.CODEC)
+                              .copyOnDeath()
+              );
+
+              public static MenuType<BagMenu> BAG_MENU;
 
               @Override
               public void onInitialize() {
-                  PayloadTypeRegistry.serverboundPlay().register(LayoutPayload.TYPE, LayoutPayload.CODEC);
-                  PayloadTypeRegistry.clientboundPlay().register(LayoutPayload.TYPE, LayoutPayload.CODEC);
-                  LayoutState.register();
+                  BAG_MENU = Registry.register(
+                          BuiltInRegistries.MENU,
+                          id("bag"),
+                          new MenuType<>(BagMenu::new, FeatureFlagSet.of())
+                  );
+
+                  PayloadTypeRegistry.serverboundPlay().register(OpenBagPayload.TYPE, OpenBagPayload.CODEC);
+                  PayloadTypeRegistry.serverboundPlay().register(SlotEditPayload.TYPE, SlotEditPayload.CODEC);
+
+                  ServerPlayNetworking.registerGlobalReceiver(OpenBagPayload.TYPE, (payload, context) -> {
+                      ServerPlayer player = context.player();
+                      player.openMenu(new SimpleMenuProvider(
+                              (containerId, inventory, p) -> new BagMenu(containerId, inventory, player),
+                              Component.translatable("container.bigbag.bag")
+                      ));
+                  });
+
+                  ServerPlayNetworking.registerGlobalReceiver(SlotEditPayload.TYPE, (payload, context) -> {
+                      if (context.player().containerMenu instanceof BagMenu menu) {
+                          menu.setUnlocked(payload.slot(), payload.unlock());
+                      }
+                  });
               }
           }
-          BIGINV_EOF
-          cat > 'src/main/java/com/biginventory/LayoutPayload.java' <<'BIGINV_EOF'
-          package com.biginventory;
+          EOF
+
+          mkdir -p src/main/java/com/bigbag
+          cat > src/main/java/com/bigbag/OpenBagPayload.java <<'EOF'
+          package com.bigbag;
 
           import net.minecraft.network.RegistryFriendlyByteBuf;
-          import net.minecraft.network.codec.ByteBufCodecs;
           import net.minecraft.network.codec.StreamCodec;
           import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 
-          /**
-           * Раскладка добавленных слотов.
-           * Клиент -> сервер: "хочу вот так" (по ЛКМ в режиме правки).
-           * Сервер -> клиент: "принято вот так" (после проверки лимитов).
-           *
-           * @param columns     сколько дополнительных колонок
-           * @param removedMask бит N = 1, если добавленный слот N удалён (номер = колонка * 4 + строка)
-           */
-          public record LayoutPayload(int columns, int removedMask) implements CustomPacketPayload {
-
-              public static final CustomPacketPayload.Type<LayoutPayload> TYPE =
-                      new CustomPacketPayload.Type<>(BigInventory.id("layout"));
-
-              public static final StreamCodec<RegistryFriendlyByteBuf, LayoutPayload> CODEC = StreamCodec.composite(
-                      ByteBufCodecs.VAR_INT, LayoutPayload::columns,
-                      ByteBufCodecs.VAR_INT, LayoutPayload::removedMask,
-                      LayoutPayload::new);
+          /** Client -> server: "open my bag". */
+          public record OpenBagPayload() implements CustomPacketPayload {
+              public static final CustomPacketPayload.Type<OpenBagPayload> TYPE =
+                      new CustomPacketPayload.Type<>(BigBagMod.id("open_bag"));
+              public static final StreamCodec<RegistryFriendlyByteBuf, OpenBagPayload> CODEC =
+                      StreamCodec.unit(new OpenBagPayload());
 
               @Override
               public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
                   return TYPE;
               }
           }
-          BIGINV_EOF
-          cat > 'src/main/java/com/biginventory/LayoutState.java' <<'BIGINV_EOF'
-          package com.biginventory;
+          EOF
 
-          import java.util.HashMap;
-          import java.util.Map;
-          import java.util.UUID;
-          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
-          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          mkdir -p src/main/java/com/bigbag
+          cat > src/main/java/com/bigbag/SlotEditPayload.java <<'EOF'
+          package com.bigbag;
 
-          /**
-           * Серверная сторона: раскладка каждого игрока. Клиенту верить нельзя, поэтому всё проверяется здесь:
-           * число колонок ограничено, а биты удалённых слотов за пределами колонок сбрасываются.
-           * (Пока хранится только в памяти; сохранение вместе с данными игрока - на этапе 3.)
-           */
-          public final class LayoutState {
-              public record Layout(int columns, int removedMask) {
-              }
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 
-              private static final Map<UUID, Layout> LAYOUTS = new HashMap<>();
-
-              private LayoutState() {
-              }
-
-              public static Layout get(UUID player) {
-                  return LAYOUTS.getOrDefault(player, new Layout(0, 0));
-              }
-
-              public static void register() {
-                  ServerPlayNetworking.registerGlobalReceiver(LayoutPayload.TYPE, (payload, context) -> {
-                      int columns = Math.max(0, Math.min(BigInventory.MAX_COLUMNS, payload.columns()));
-                      int mask = payload.removedMask() & BigInventory.validMask(columns);
-                      LAYOUTS.put(context.player().getUUID(), new Layout(columns, mask));
-                      ServerPlayNetworking.send(context.player(), new LayoutPayload(columns, mask));
-                  });
-
-                  ServerLifecycleEvents.SERVER_STOPPED.register(server -> LAYOUTS.clear());
-              }
-          }
-          BIGINV_EOF
-          mkdir -p 'src/client/java/com/biginventory/client'
-          cat > 'src/client/java/com/biginventory/client/BigInventoryClient.java' <<'BIGINV_EOF'
-          package com.biginventory.client;
-
-          import com.biginventory.BigInventory;
-          import com.biginventory.LayoutPayload;
-          import com.mojang.blaze3d.platform.InputConstants;
-          import net.fabricmc.api.ClientModInitializer;
-          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
-          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
-          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
-          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
-          import net.minecraft.client.KeyMapping;
-          import org.lwjgl.glfw.GLFW;
-
-          public class BigInventoryClient implements ClientModInitializer {
-              private static KeyMapping openKey;
-
-              /** Что подтвердил сервер. */
-              public static int confirmedColumns = 0;
-              public static int confirmedMask = 0;
-
-              /** Сохраняет раскладку и отправляет её на сервер. */
-              public static void requestLayout(int columns, int removedMask) {
-                  ClientConfig.columns = columns;
-                  ClientConfig.removedMask = removedMask;
-                  ClientConfig.save();
-                  if (ClientPlayNetworking.canSend(LayoutPayload.TYPE)) {
-                      ClientPlayNetworking.send(new LayoutPayload(columns, removedMask));
-                  }
-              }
+          /** Client -> server: unlock (LMB) or remove (RMB) one extra slot. */
+          public record SlotEditPayload(int slot, boolean unlock) implements CustomPacketPayload {
+              public static final CustomPacketPayload.Type<SlotEditPayload> TYPE =
+                      new CustomPacketPayload.Type<>(BigBagMod.id("slot_edit"));
+              public static final StreamCodec<RegistryFriendlyByteBuf, SlotEditPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.VAR_INT, SlotEditPayload::slot,
+                      ByteBufCodecs.BOOL, SlotEditPayload::unlock,
+                      SlotEditPayload::new
+              );
 
               @Override
-              public void onInitializeClient() {
-                  ClientConfig.load();
-
-                  KeyMapping.Category category = KeyMapping.Category.register(BigInventory.id("main"));
-
-                  openKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-                          "key.biginventory.open",
-                          InputConstants.Type.KEYSYM,
-                          GLFW.GLFW_KEY_G,
-                          category));
-
-                  ClientPlayNetworking.registerGlobalReceiver(LayoutPayload.TYPE, (payload, context) -> {
-                      confirmedColumns = payload.columns();
-                      confirmedMask = payload.removedMask();
-                  });
-
-                  // При входе в мир сервер ничего не знает о наших настройках - отправляем.
-                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) ->
-                          requestLayout(ClientConfig.columns, ClientConfig.removedMask));
-
-                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
-                      if (client.player == null) {
-                          return;
-                      }
-                      while (openKey.consumeClick()) {
-                          if (client.gui.screen() == null) {
-                              client.gui.setScreen(new LayoutScreen());
-                          }
-                      }
-                  });
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
               }
           }
-          BIGINV_EOF
-          cat > 'src/client/java/com/biginventory/client/LayoutScreen.java' <<'BIGINV_EOF'
-          package com.biginventory.client;
+          EOF
 
-          import com.biginventory.BigInventory;
+          mkdir -p src/main/java/com/bigbag/client
+          cat > src/main/java/com/bigbag/client/BagScreen.java <<'EOF'
+          package com.bigbag.client;
+
+          import com.bigbag.BagMenu;
+          import com.bigbag.SlotEditPayload;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
           import net.minecraft.client.gui.GuiGraphicsExtractor;
-          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+          import net.minecraft.client.input.KeyEvent;
           import net.minecraft.client.input.MouseButtonEvent;
           import net.minecraft.network.chat.Component;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.inventory.Slot;
 
-          /**
-           * Режим правки раскладки. Рисует сетку слотов (мигающую) вместо обычного инвентаря, поэтому
-           * пользоваться предметами в нём нельзя.
-           *
-           * Управление:
-           *  - Shift + ЛКМ по правому краю и тянуть вправо/влево: добавить/убрать колонки;
-           *  - ПКМ по добавленному слоту: удалить слот (повторно: вернуть);
-           *  - ЛКМ: подтвердить и отправить на сервер;
-           *  - Esc: отмена.
-           */
-          public class LayoutScreen extends Screen {
-              private static final int CELL = 18;
-              private static final int BASE_COLS = 9;
-              private static final int ROWS = BigInventory.ROWS;
+          public class BagScreen extends AbstractContainerScreen<BagMenu> {
+              private static final int KEY_ESCAPE = 256;
+              /** Edit mode: everything blinks and is locked; LMB = add slot, RMB = remove slot. */
+              private boolean editing = false;
 
-              private int workCols;
-              private int workMask;
-              private boolean dragging;
-
-              public LayoutScreen() {
-                  super(Component.translatable("biginventory.menu.title"));
-                  this.workCols = Math.min(ClientConfig.columns, BigInventory.MAX_COLUMNS);
-                  this.workMask = ClientConfig.removedMask & BigInventory.validMask(this.workCols);
+              public BagScreen(BagMenu menu, Inventory inventory, Component title) {
+                  super(menu, inventory, title);
+                  this.imageWidth = 176;
+                  this.imageHeight = 222;
+                  this.inventoryLabelY = this.imageHeight - 94;
               }
 
-              // ---------- геометрия ----------
-
-              /** Левый край сетки: ванильные 9 колонок по центру, добавленные растут вправо (чтобы край не "убегал" от мыши). */
-              private int gridLeft() {
-                  return (this.width - BASE_COLS * CELL) / 2;
-              }
-
-              private int gridTop() {
-                  return this.height / 2 - 40;
-              }
-
-              /** Строки 0..2 - инвентарь, строка 3 - хотбар (отделён зазором 4 px). */
-              private int rowY(int row) {
-                  return gridTop() + row * CELL + (row == ROWS - 1 ? 4 : 0);
-              }
-
-              private int colX(int col) {
-                  return gridLeft() + col * CELL;
-              }
-
-              private int edgeX() {
-                  return colX(BASE_COLS + this.workCols);
-              }
-
-              private static int slotId(int col, int row) {
-                  return (col - BASE_COLS) * ROWS + row;
-              }
-
-              private boolean isRemoved(int id) {
-                  return (this.workMask & (1 << id)) != 0;
-              }
-
-              private boolean onHandle(double mx, double my) {
-                  return mx >= edgeX() - 3 && mx <= edgeX() + 9
-                          && my >= rowY(0) && my <= rowY(ROWS - 1) + CELL;
-              }
-
-              private void setColumns(int columns) {
-                  this.workCols = Math.max(0, Math.min(BigInventory.MAX_COLUMNS, columns));
-                  // удалённые слоты в убранных колонках больше не существуют
-                  this.workMask &= BigInventory.validMask(this.workCols);
-              }
-
-              private void toggleSlotAt(double mx, double my) {
-                  for (int col = BASE_COLS; col < BASE_COLS + this.workCols; col++) {
-                      for (int row = 0; row < ROWS; row++) {
-                          int x = colX(col);
-                          int y = rowY(row);
-                          if (mx >= x && mx < x + CELL && my >= y && my < y + CELL) {
-                              this.workMask ^= 1 << slotId(col, row);
-                              return;
-                          }
-                      }
-                  }
-              }
-
-              // ---------- ввод ----------
-
-              @Override
-              public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
-                  double mx = event.x();
-                  double my = event.y();
-                  int button = event.button();
-
-                  if (button == 0) {
-                      if (event.hasShiftDown() && onHandle(mx, my)) {
-                          this.dragging = true; // начали растягивать: это ещё не подтверждение
-                          return true;
-                      }
-                      BigInventoryClient.requestLayout(this.workCols, this.workMask);
-                      this.onClose();
-                      return true;
-                  }
-                  if (button == 1) {
-                      toggleSlotAt(mx, my);
-                      return true;
-                  }
-                  return super.mouseClicked(event, doubleClick);
+              private boolean isLocked(int slotIndex) {
+                  return slotIndex < BagMenu.SIZE && !this.menu.isUnlocked(slotIndex);
               }
 
               @Override
-              public boolean mouseDragged(MouseButtonEvent event, double dragX, double dragY) {
-                  if (this.dragging) {
-                      int columns = (int) Math.round((event.x() - gridLeft()) / (double) CELL) - BASE_COLS;
-                      setColumns(columns);
-                      return true;
-                  }
-                  return super.mouseDragged(event, dragX, dragY);
-              }
+              public void extractBackground(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+                  super.extractBackground(graphics, mouseX, mouseY, delta);
+                  int x = this.leftPos;
+                  int y = this.topPos;
+                  graphics.fill(x, y, x + this.imageWidth, y + this.imageHeight, 0xFF000000);
+                  graphics.fill(x + 1, y + 1, x + this.imageWidth - 1, y + this.imageHeight - 1, 0xFFC6C6C6);
 
-              @Override
-              public boolean mouseReleased(MouseButtonEvent event) {
-                  if (this.dragging) {
-                      this.dragging = false;
-                      return true;
+                  for (int i = 0; i < this.menu.slots.size(); i++) {
+                      Slot s = this.menu.slots.get(i);
+                      int sx = x + s.x - 1;
+                      int sy = y + s.y - 1;
+                      graphics.fill(sx, sy, sx + 18, sy + 18, 0xFF373737);
+                      graphics.fill(sx + 1, sy + 1, sx + 18, sy + 18, 0xFFFFFFFF);
+                      graphics.fill(sx + 1, sy + 1, sx + 17, sy + 17, isLocked(i) ? 0xFF4A4A4A : 0xFF8B8B8B);
                   }
-                  return super.mouseReleased(event);
               }
-
-              // ---------- отрисовка ----------
 
               @Override
               public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
                   super.extractRenderState(graphics, mouseX, mouseY, delta);
+                  if (!this.editing) {
+                      return;
+                  }
+                  boolean bright = (System.currentTimeMillis() / 350L) % 2L == 0L;
+                  int blink = bright ? 0x80FFE060 : 0x30FFE060;
+                  for (int i = 0; i < this.menu.slots.size(); i++) {
+                      Slot s = this.menu.slots.get(i);
+                      int sx = this.leftPos + s.x;
+                      int sy = this.topPos + s.y;
+                      if (isLocked(i)) {
+                          // green "+" on a locked slot: LMB adds it
+                          graphics.fill(sx + 3, sy + 7, sx + 13, sy + 9, 0xFF55FF55);
+                          graphics.fill(sx + 7, sy + 3, sx + 9, sy + 13, 0xFF55FF55);
+                      } else {
+                          graphics.fill(sx, sy, sx + 16, sy + 16, blink);
+                      }
+                  }
+              }
 
-                  float pulse = 0.5f + 0.5f * (float) Math.sin(System.currentTimeMillis() / 200.0);
-                  int glow = ((int) (90 + pulse * 165) << 24) | 0xFFFFFF; // мигание добавленных слотов
-                  int dim = ((int) (30 + pulse * 70) << 24) | 0xFFFFFF;   // мигание обычных слотов
-
-                  for (int row = 0; row < ROWS; row++) {
-                      for (int col = 0; col < BASE_COLS + this.workCols; col++) {
-                          int x = colX(col);
-                          int y = rowY(row);
-                          boolean extra = col >= BASE_COLS;
-                          boolean removed = extra && isRemoved(slotId(col, row));
-                          boolean hovered = extra && mouseX >= x && mouseX < x + CELL && mouseY >= y && mouseY < y + CELL;
-
-                          int border = removed ? 0xFFAA3333 : (extra ? glow : dim);
-                          int inner = removed ? 0xFF3A1010 : (hovered ? 0xFF505050 : 0xFF373737);
-
-                          graphics.fill(x, y, x + CELL, y + CELL, border);
-                          graphics.fill(x + 1, y + 1, x + CELL - 1, y + CELL - 1, inner);
-                          if (removed) {
-                              drawCentered(graphics, "x", x + CELL / 2, y + 5, 0xFFFF5555);
+              @Override
+              public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+                  if (!this.editing) {
+                      return super.mouseClicked(event, doubleClick);
+                  }
+                  Slot slot = this.getSlotUnderMouse();
+                  if (slot != null) {
+                      int idx = this.menu.slots.indexOf(slot);
+                      if (idx >= 0 && idx < BagMenu.SIZE) {
+                          boolean unlocked = this.menu.isUnlocked(idx);
+                          if (event.button() == 0 && !unlocked) {
+                              ClientPlayNetworking.send(new SlotEditPayload(idx, true));
+                          } else if (event.button() == 1 && unlocked) {
+                              ClientPlayNetworking.send(new SlotEditPayload(idx, false));
                           }
                       }
                   }
-
-                  // ручка для растягивания у правого края
-                  int hx = edgeX() + 1;
-                  graphics.fill(hx, rowY(0), hx + 4, rowY(ROWS - 1) + CELL, this.dragging ? 0xFFFFFF55 : glow);
-
-                  int cx = this.width / 2;
-                  drawCentered(graphics, this.title.getString(), cx, gridTop() - 28, 0xFFFFFFFF);
-                  drawCentered(graphics, Component.translatable("biginventory.menu.info", this.workCols,
-                          this.workCols * ROWS - Integer.bitCount(this.workMask)).getString(),
-                          cx, gridTop() - 14, 0xFFFFFFFF);
-
-                  int below = rowY(ROWS - 1) + CELL + 12;
-                  drawCentered(graphics, Component.translatable("biginventory.menu.hint1").getString(), cx, below, 0xFFA0A0A0);
-                  drawCentered(graphics, Component.translatable("biginventory.menu.hint2").getString(), cx, below + 12, 0xFFA0A0A0);
-                  drawCentered(graphics, Component.translatable("biginventory.menu.hint3").getString(), cx, below + 24, 0xFFA0A0A0);
+                  return true;
               }
 
-              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
-                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
+              @Override
+              public boolean keyPressed(KeyEvent event) {
+                  if (BigBagClient.EDIT_KEY.matches(event)) {
+                      if (this.editing) {
+                          this.editing = false;
+                      } else if (this.menu.getCarried().isEmpty()) {
+                          this.editing = true;
+                      }
+                      return true;
+                  }
+                  if (BigBagClient.OPEN_KEY.matches(event)) {
+                      this.onClose();
+                      return true;
+                  }
+                  if (this.editing) {
+                      if (event.key() == KEY_ESCAPE) {
+                          this.editing = false;
+                      }
+                      return true;
+                  }
+                  return super.keyPressed(event);
               }
           }
-          BIGINV_EOF
-          cat > 'src/client/java/com/biginventory/client/ClientConfig.java' <<'BIGINV_EOF'
-          package com.biginventory.client;
+          EOF
 
-          import java.io.IOException;
-          import java.io.Reader;
-          import java.io.Writer;
-          import java.nio.file.Files;
-          import java.nio.file.Path;
-          import java.util.Properties;
-          import net.fabricmc.loader.api.FabricLoader;
+          mkdir -p src/main/java/com/bigbag/client
+          cat > src/main/java/com/bigbag/client/BigBagClient.java <<'EOF'
+          package com.bigbag.client;
 
-          /** Настройки игрока на клиенте: файл config/biginventory.properties. */
-          public final class ClientConfig {
-              public static int columns = 0;
-              public static int removedMask = 0;
+          import com.bigbag.BigBagMod;
+          import com.bigbag.OpenBagPayload;
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.gui.screens.MenuScreens;
 
-              private ClientConfig() {
-              }
+          public class BigBagClient implements ClientModInitializer {
+              public static final KeyMapping.Category CATEGORY = KeyMapping.Category.register(BigBagMod.id("main"));
+              public static KeyMapping OPEN_KEY;
+              public static KeyMapping EDIT_KEY;
 
-              private static Path file() {
-                  return FabricLoader.getInstance().getConfigDir().resolve("biginventory.properties");
-              }
+              @Override
+              public void onInitializeClient() {
+                  OPEN_KEY = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                          "key.bigbag.open", InputConstants.Type.KEYSYM, InputConstants.KEY_B, CATEGORY));
+                  EDIT_KEY = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                          "key.bigbag.edit", InputConstants.Type.KEYSYM, InputConstants.KEY_G, CATEGORY));
 
-              public static void load() {
-                  Path path = file();
-                  if (!Files.exists(path)) {
-                      return;
-                  }
-                  Properties props = new Properties();
-                  try (Reader reader = Files.newBufferedReader(path)) {
-                      props.load(reader);
-                  } catch (IOException e) {
-                      return;
-                  }
-                  try {
-                      columns = Math.max(0, Integer.parseInt(props.getProperty("columns", "0").trim()));
-                      removedMask = Math.max(0, Integer.parseInt(props.getProperty("removedMask", "0").trim()));
-                  } catch (NumberFormatException e) {
-                      columns = 0;
-                      removedMask = 0;
-                  }
-              }
+                  MenuScreens.register(BigBagMod.BAG_MENU, BagScreen::new);
 
-              public static void save() {
-                  Properties props = new Properties();
-                  props.setProperty("columns", Integer.toString(columns));
-                  props.setProperty("removedMask", Integer.toString(removedMask));
-                  try (Writer writer = Files.newBufferedWriter(file())) {
-                      props.store(writer, "Bigger Inventory");
-                  } catch (IOException e) {
-                      // не критично: настройки просто не сохранятся на диск
-                  }
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (OPEN_KEY.consumeClick()) {
+                          if (client.player != null) {
+                              ClientPlayNetworking.send(new OpenBagPayload());
+                          }
+                      }
+                  });
               }
           }
-          BIGINV_EOF
-          mkdir -p 'src/main/resources/assets/biginventory/lang'
-          cat > 'src/main/resources/assets/biginventory/lang/en_us.json' <<'BIGINV_EOF'
+          EOF
+
+          mkdir -p src/main/resources/assets/bigbag/lang
+          cat > src/main/resources/assets/bigbag/lang/en_us.json <<'EOF'
           {
-            "key.biginventory.open": "Edit inventory layout",
-            "key.category.biginventory.main": "Bigger Inventory",
-
-            "biginventory.menu.title": "Inventory Layout",
-            "biginventory.menu.info": "Extra columns: %s, extra slots: %s",
-            "biginventory.menu.hint1": "Shift + drag the right edge: add or remove columns",
-            "biginventory.menu.hint2": "Right click a slot: remove / restore it",
-            "biginventory.menu.hint3": "Left click: confirm   Esc: cancel"
+            "key.category.bigbag.main": "Big Bag",
+            "key.bigbag.open": "Open bag",
+            "key.bigbag.edit": "Edit slots (inside the bag)",
+            "container.bigbag.bag": "Big Bag"
           }
-          BIGINV_EOF
-          cat > 'src/main/resources/assets/biginventory/lang/ru_ru.json' <<'BIGINV_EOF'
+          EOF
+
+          mkdir -p src/main/resources/assets/bigbag/lang
+          cat > src/main/resources/assets/bigbag/lang/ru_ru.json <<'EOF'
           {
-            "key.biginventory.open": "Править раскладку инвентаря",
-            "key.category.biginventory.main": "Bigger Inventory",
-
-            "biginventory.menu.title": "Раскладка инвентаря",
-            "biginventory.menu.info": "Доп. колонок: %s, доп. слотов: %s",
-            "biginventory.menu.hint1": "Shift + тянуть правый край: добавить или убрать колонки",
-            "biginventory.menu.hint2": "ПКМ по слоту: удалить / вернуть слот",
-            "biginventory.menu.hint3": "ЛКМ: подтвердить   Esc: отмена"
+            "key.category.bigbag.main": "Большой инвентарь",
+            "key.bigbag.open": "Открыть инвентарь",
+            "key.bigbag.edit": "Редактировать слоты (внутри инвентаря)",
+            "container.bigbag.bag": "Большой инвентарь"
           }
-          BIGINV_EOF
-          cat > 'src/main/resources/fabric.mod.json' <<'BIGINV_EOF'
+          EOF
+
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'EOF'
           {
             "schemaVersion": 1,
-            "id": "biginventory",
+            "id": "bigbag",
             "version": "${version}",
-            "name": "Bigger Inventory",
-            "description": "Больше слотов в инвентаре и хотбаре: колонки добавляются по хоткею.",
-            "authors": [],
+            "name": "Big Bag",
+            "description": "Extra inventory slots. Press B to open the bag, G inside to add/remove slots.",
             "license": "MIT",
             "environment": "*",
             "entrypoints": {
-              "main": [
-                "com.biginventory.BigInventory"
-              ],
-              "client": [
-                "com.biginventory.client.BigInventoryClient"
-              ]
+              "main": ["com.bigbag.BigBagMod"],
+              "client": ["com.bigbag.client.BigBagClient"]
             },
             "depends": {
               "fabricloader": ">=0.19.3",
@@ -580,96 +578,14 @@ jobs:
               "fabric-api": "*"
             }
           }
-          BIGINV_EOF
+          EOF
+
 
       - name: Build
-        run: gradle build --stacktrace
+        run: gradle build --no-daemon
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: biginventory
-          path: |
-            build/libs/*.jar
-            !build/libs/*-sources.jar
-
-      # Выгрузка исходников нужных классов Minecraft (только при ручном запуске с галочкой inspect).
-      # Выполняется, даже если сборка выше упала, и сама сборку не ломает.
-      - name: Dump Minecraft sources (for writing mixins)
-        if: ${{ always() && inputs.inspect }}
-        continue-on-error: true
-        timeout-minutes: 40
-        run: |
-          gradle genSources --stacktrace
-          mkdir -p inspect/src
-          SRC=$(find "$HOME/.gradle" .gradle -name '*sources*.jar' 2>/dev/null | grep -i minecraft | head -n 6)
-          echo "Sources jars found:"
-          echo "$SRC"
-          for jar in $SRC; do
-            unzip -o -q "$jar" -d inspect/src || true
-          done
-
-          OUT=inspect/mc-sources.txt
-          : > "$OUT"
-
-          # Целиком
-          for f in \
-            net/minecraft/world/entity/player/Inventory \
-            net/minecraft/world/inventory/InventoryMenu \
-            net/minecraft/world/inventory/Slot \
-            net/minecraft/world/inventory/ChestMenu \
-            net/minecraft/network/protocol/game/ServerboundSetCarriedItemPacket \
-            net/minecraft/client/input/MouseButtonEvent \
-            net/minecraft/client/input/InputWithModifiers ; do
-            p=$(find inspect/src -path "*/$f.java" | head -n 1)
-            if [ -n "$p" ]; then
-              { echo "=== $f ==="; cat "$p"; echo; } >> "$OUT"
-            else
-              echo "=== $f: NOT FOUND ===" >> "$OUT"
-            fi
-          done
-
-          # Только места про хотбар / выбранный слот / колесо / отрисовку слотов / мышь
-          for f in \
-            net/minecraft/client/gui/Gui \
-            net/minecraft/client/gui/screens/inventory/AbstractContainerScreen \
-            net/minecraft/client/gui/screens/inventory/InventoryScreen \
-            net/minecraft/client/MouseHandler ; do
-            p=$(find inspect/src -path "*/$f.java" | head -n 1)
-            if [ -n "$p" ]; then
-              { echo "=== $f (filtered) ==="; grep -n -i -B2 -A10 -E 'hotbar|selected|scroll|renderSlot|SLOT' "$p"; echo; } >> "$OUT"
-            else
-              echo "=== $f: NOT FOUND ===" >> "$OUT"
-            fi
-          done
-
-          # Сигнатуры методов экрана и отрисовки (для правки LayoutScreen, если сборка не пройдёт)
-          for f in \
-            net/minecraft/client/gui/screens/Screen \
-            net/minecraft/client/gui/GuiGraphicsExtractor ; do
-            p=$(find inspect/src -path "*/$f.java" | head -n 1)
-            if [ -n "$p" ]; then
-              { echo "=== $f (signatures) ==="; grep -n -E 'public .*\(' "$p" | grep -i -E 'mouse|key|shift|fill|text|outline|blit|extract|pause'; echo; } >> "$OUT"
-            else
-              echo "=== $f: NOT FOUND ===" >> "$OUT"
-            fi
-          done
-
-          wc -l "$OUT"
-
-      - name: Upload source dump
-        if: ${{ always() && inputs.inspect }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: mc-sources
-          path: inspect/mc-sources.txt
-          if-no-files-found: ignore
-
-      # При пуше тега вида v1.0.0 jar прикрепляется к GitHub Release
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            build/libs/*.jar
-            !build/libs/*-sources.jar
+          name: bigbag-jar
+          path: build/libs/*.jar
