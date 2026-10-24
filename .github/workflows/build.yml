@@ -1,11 +1,22 @@
 name: build
 
+# Самодостаточный workflow: весь код мода встроен в этот файл.
+# Положите его в .github/workflows/build.yml пустого репозитория и запустите (Actions -> build -> Run workflow).
+#
+# Этап 1: рабочий скелет (хоткей G -> экран с кнопками +/- колонки -> сервер проверяет и подтверждает).
+# Галочка "inspect" при ручном запуске выгружает исходники нужных классов Minecraft 26.2
+# в артефакт mc-sources: по ним пишутся миксины для реальных слотов (инвентарь, хотбар, меню).
+
 on:
   push:
-    branches: [main, master]
-    tags: ['v*']
-  pull_request:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
   workflow_dispatch:
+    inputs:
+      inspect:
+        description: 'Выгрузить исходники Minecraft (нужно для миксинов)'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -14,38 +25,488 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 25
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.7.0
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Generate mod project
+        run: |
+          cat > 'gradle.properties' <<'BIGINV_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          org.gradle.configuration-cache=false
+
+          # Fabric (https://fabricmc.net/develop)
+          minecraft_version=26.2
+          loader_version=0.19.5
+          loom_version=1.18.4
+          fabric_api_version=0.161.0+26.2
+
+          # Мод
+          mod_version=0.1.0
+          maven_group=com.biginventory
+          archives_base_name=biginventory
+          BIGINV_EOF
+          cat > 'settings.gradle' <<'BIGINV_EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          BIGINV_EOF
+          cat > 'build.gradle' <<'BIGINV_EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          loom {
+              splitEnvironmentSourceSets()
+
+              mods {
+                  "biginventory" {
+                      sourceSet sourceSets.main
+                      sourceSet sourceSets.client
+                  }
+              }
+          }
+
+          dependencies {
+              // Minecraft 26.x не обфусцирован: маппинги и remap не нужны
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+              it.options.encoding = "UTF-8"
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          BIGINV_EOF
+          mkdir -p 'src/main/java/com/biginventory'
+          cat > 'src/main/java/com/biginventory/BigInventory.java' <<'BIGINV_EOF'
+          package com.biginventory;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.minecraft.resources.Identifier;
+
+          public class BigInventory implements ModInitializer {
+              public static final String MOD_ID = "biginventory";
+
+              /** Максимум дополнительных колонок (1 колонка = 3 слота инвентаря + 1 слот хотбара). */
+              public static final int MAX_COLUMNS = 6;
+
+              public static Identifier id(String path) {
+                  return Identifier.fromNamespaceAndPath(MOD_ID, path);
+              }
+
+              @Override
+              public void onInitialize() {
+                  PayloadTypeRegistry.serverboundPlay().register(ColumnsPayload.TYPE, ColumnsPayload.CODEC);
+                  PayloadTypeRegistry.clientboundPlay().register(ColumnsPayload.TYPE, ColumnsPayload.CODEC);
+                  ColumnsState.register();
+              }
+          }
+          BIGINV_EOF
+          cat > 'src/main/java/com/biginventory/ColumnsPayload.java' <<'BIGINV_EOF'
+          package com.biginventory;
+
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+          /**
+           * Клиент -> сервер: "хочу столько дополнительных колонок".
+           * Сервер -> клиент: "столько колонок тебе разрешено" (после проверки лимита).
+           */
+          public record ColumnsPayload(int columns) implements CustomPacketPayload {
+
+              public static final CustomPacketPayload.Type<ColumnsPayload> TYPE =
+                      new CustomPacketPayload.Type<>(BigInventory.id("columns"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, ColumnsPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.VAR_INT, ColumnsPayload::columns,
+                      ColumnsPayload::new);
+
+              @Override
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          BIGINV_EOF
+          cat > 'src/main/java/com/biginventory/ColumnsState.java' <<'BIGINV_EOF'
+          package com.biginventory;
+
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.UUID;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+
+          /** Серверная сторона: сколько колонок разрешено каждому игроку. Клиенту верить нельзя, поэтому лимит проверяется здесь. */
+          public final class ColumnsState {
+              private static final Map<UUID, Integer> COLUMNS = new HashMap<>();
+
+              private ColumnsState() {
+              }
+
+              public static int get(UUID player) {
+                  return COLUMNS.getOrDefault(player, 0);
+              }
+
+              public static void register() {
+                  ServerPlayNetworking.registerGlobalReceiver(ColumnsPayload.TYPE, (payload, context) -> {
+                      int columns = Math.max(0, Math.min(BigInventory.MAX_COLUMNS, payload.columns()));
+                      COLUMNS.put(context.player().getUUID(), columns);
+                      ServerPlayNetworking.send(context.player(), new ColumnsPayload(columns));
+                  });
+
+                  ServerLifecycleEvents.SERVER_STOPPED.register(server -> COLUMNS.clear());
+              }
+          }
+          BIGINV_EOF
+          mkdir -p 'src/client/java/com/biginventory/client'
+          cat > 'src/client/java/com/biginventory/client/BigInventoryClient.java' <<'BIGINV_EOF'
+          package com.biginventory.client;
+
+          import com.biginventory.BigInventory;
+          import com.biginventory.ColumnsPayload;
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.KeyMapping;
+          import org.lwjgl.glfw.GLFW;
+
+          public class BigInventoryClient implements ClientModInitializer {
+              private static KeyMapping openKey;
+
+              /** Сколько колонок подтвердил сервер. */
+              public static int confirmedColumns = 0;
+
+              /** Сохраняет желаемое число колонок и отправляет запрос на сервер. */
+              public static void requestColumns(int columns) {
+                  ClientConfig.columns = columns;
+                  ClientConfig.save();
+                  if (ClientPlayNetworking.canSend(ColumnsPayload.TYPE)) {
+                      ClientPlayNetworking.send(new ColumnsPayload(columns));
+                  }
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  ClientConfig.load();
+
+                  KeyMapping.Category category = KeyMapping.Category.register(BigInventory.id("main"));
+
+                  openKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                          "key.biginventory.open",
+                          InputConstants.Type.KEYSYM,
+                          GLFW.GLFW_KEY_G,
+                          category));
+
+                  ClientPlayNetworking.registerGlobalReceiver(ColumnsPayload.TYPE,
+                          (payload, context) -> confirmedColumns = payload.columns());
+
+                  // При входе в мир сервер ничего не знает о наших настройках - отправляем.
+                  ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> requestColumns(ClientConfig.columns));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      if (client.player == null) {
+                          return;
+                      }
+                      while (openKey.consumeClick()) {
+                          if (client.gui.screen() == null) {
+                              client.gui.setScreen(new ColumnsScreen());
+                          }
+                      }
+                  });
+              }
+          }
+          BIGINV_EOF
+          cat > 'src/client/java/com/biginventory/client/ColumnsScreen.java' <<'BIGINV_EOF'
+          package com.biginventory.client;
+
+          import com.biginventory.BigInventory;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /** Этап 1: кнопки +/-. На этапе 2 здесь появится растягивание панели мышкой с зажатым Shift. */
+          public class ColumnsScreen extends Screen {
+              private Button minusButton;
+              private Button plusButton;
+
+              public ColumnsScreen() {
+                  super(Component.translatable("biginventory.menu.title"));
+              }
+
+              private int top() {
+                  return this.height / 2 - 50;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = this.width / 2;
+                  int top = top();
+
+                  this.minusButton = this.addRenderableWidget(Button.builder(Component.literal("-"), b -> change(-1))
+                          .bounds(cx - 100, top + 30, 40, 20).build());
+
+                  this.plusButton = this.addRenderableWidget(Button.builder(Component.literal("+"), b -> change(1))
+                          .bounds(cx + 60, top + 30, 40, 20).build());
+
+                  this.addRenderableWidget(Button.builder(Component.translatable("biginventory.menu.done"), b -> this.onClose())
+                          .bounds(cx - 100, top + 90, 200, 20).build());
+
+                  refresh();
+              }
+
+              private void change(int delta) {
+                  int value = Math.max(0, Math.min(BigInventory.MAX_COLUMNS, ClientConfig.columns + delta));
+                  BigInventoryClient.requestColumns(value);
+                  refresh();
+              }
+
+              private void refresh() {
+                  this.minusButton.active = ClientConfig.columns > 0;
+                  this.plusButton.active = ClientConfig.columns < BigInventory.MAX_COLUMNS;
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+                  super.extractRenderState(graphics, mouseX, mouseY, delta);
+
+                  int cx = this.width / 2;
+                  int top = top();
+
+                  drawCentered(graphics, this.title.getString(), cx, top, 0xFFFFFFFF);
+                  drawCentered(graphics, Component.translatable("biginventory.menu.columns", ClientConfig.columns).getString(),
+                          cx, top + 36, 0xFFFFFFFF);
+                  drawCentered(graphics, Component.translatable("biginventory.menu.info",
+                          ClientConfig.columns * 4, BigInventoryClient.confirmedColumns).getString(),
+                          cx, top + 62, 0xFFA0A0A0);
+              }
+
+              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
+                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
+              }
+          }
+          BIGINV_EOF
+          cat > 'src/client/java/com/biginventory/client/ClientConfig.java' <<'BIGINV_EOF'
+          package com.biginventory.client;
+
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          /** Настройки игрока на клиенте: файл config/biginventory.properties. */
+          public final class ClientConfig {
+              public static int columns = 0;
+
+              private ClientConfig() {
+              }
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("biginventory.properties");
+              }
+
+              public static void load() {
+                  Path path = file();
+                  if (!Files.exists(path)) {
+                      return;
+                  }
+                  Properties props = new Properties();
+                  try (Reader reader = Files.newBufferedReader(path)) {
+                      props.load(reader);
+                  } catch (IOException e) {
+                      return;
+                  }
+                  try {
+                      columns = Math.max(0, Integer.parseInt(props.getProperty("columns", "0").trim()));
+                  } catch (NumberFormatException e) {
+                      columns = 0;
+                  }
+              }
+
+              public static void save() {
+                  Properties props = new Properties();
+                  props.setProperty("columns", Integer.toString(columns));
+                  try (Writer writer = Files.newBufferedWriter(file())) {
+                      props.store(writer, "Bigger Inventory");
+                  } catch (IOException e) {
+                      // не критично: настройки просто не сохранятся на диск
+                  }
+              }
+          }
+          BIGINV_EOF
+          mkdir -p 'src/main/resources/assets/biginventory/lang'
+          cat > 'src/main/resources/assets/biginventory/lang/en_us.json' <<'BIGINV_EOF'
+          {
+            "key.biginventory.open": "Open inventory size menu",
+            "key.category.biginventory.main": "Bigger Inventory",
+
+            "biginventory.menu.title": "Inventory Size",
+            "biginventory.menu.columns": "Columns: %s",
+            "biginventory.menu.info": "+%s slots (server confirmed: %s)",
+            "biginventory.menu.done": "Done"
+          }
+          BIGINV_EOF
+          cat > 'src/main/resources/assets/biginventory/lang/ru_ru.json' <<'BIGINV_EOF'
+          {
+            "key.biginventory.open": "Открыть меню размера инвентаря",
+            "key.category.biginventory.main": "Bigger Inventory",
+
+            "biginventory.menu.title": "Размер инвентаря",
+            "biginventory.menu.columns": "Колонок: %s",
+            "biginventory.menu.info": "+%s слотов (сервер подтвердил: %s)",
+            "biginventory.menu.done": "Готово"
+          }
+          BIGINV_EOF
+          cat > 'src/main/resources/fabric.mod.json' <<'BIGINV_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "biginventory",
+            "version": "${version}",
+            "name": "Bigger Inventory",
+            "description": "Больше слотов в инвентаре и хотбаре: колонки добавляются по хоткею.",
+            "authors": [],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": [
+                "com.biginventory.BigInventory"
+              ],
+              "client": [
+                "com.biginventory.client.BigInventoryClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.3",
+              "minecraft": "~26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          BIGINV_EOF
 
       - name: Build
-        run: ./gradlew build --no-daemon
+        run: gradle build --stacktrace
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: mod-jar
+          name: biginventory
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
-            !build/libs/*-dev.jar
 
-      - name: Create release (on tag v*)
+      # Выгрузка исходников нужных классов Minecraft (только при ручном запуске с галочкой inspect).
+      # Не ломает сборку: даже если шаг упадёт, jar уже загружен выше.
+      - name: Dump Minecraft sources (for writing mixins)
+        if: ${{ inputs.inspect }}
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          gradle genSources --stacktrace
+          mkdir -p inspect/src
+          SRC=$(find "$HOME/.gradle" .gradle -name '*sources*.jar' 2>/dev/null | grep -i minecraft | head -n 6)
+          echo "Sources jars found:"
+          echo "$SRC"
+          for jar in $SRC; do
+            unzip -o -q "$jar" -d inspect/src || true
+          done
+
+          OUT=inspect/mc-sources.txt
+          : > "$OUT"
+
+          # Целиком
+          for f in \
+            net/minecraft/world/entity/player/Inventory \
+            net/minecraft/world/inventory/InventoryMenu \
+            net/minecraft/world/inventory/Slot \
+            net/minecraft/world/inventory/ChestMenu \
+            net/minecraft/network/protocol/game/ServerboundSetCarriedItemPacket ; do
+            p=$(find inspect/src -path "*/$f.java" | head -n 1)
+            if [ -n "$p" ]; then
+              { echo "=== $f ==="; cat "$p"; echo; } >> "$OUT"
+            else
+              echo "=== $f: NOT FOUND ===" >> "$OUT"
+            fi
+          done
+
+          # Только места про хотбар / выбранный слот / колесо / отрисовку слотов
+          for f in \
+            net/minecraft/client/gui/Gui \
+            net/minecraft/client/gui/screens/inventory/AbstractContainerScreen \
+            net/minecraft/client/gui/screens/inventory/InventoryScreen \
+            net/minecraft/client/MouseHandler ; do
+            p=$(find inspect/src -path "*/$f.java" | head -n 1)
+            if [ -n "$p" ]; then
+              { echo "=== $f (filtered) ==="; grep -n -i -B2 -A10 -E 'hotbar|selected|scroll|renderSlot|SLOT' "$p"; echo; } >> "$OUT"
+            else
+              echo "=== $f: NOT FOUND ===" >> "$OUT"
+            fi
+          done
+
+          wc -l "$OUT"
+
+      - name: Upload source dump
+        if: ${{ inputs.inspect }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mc-sources
+          path: inspect/mc-sources.txt
+          if-no-files-found: ignore
+
+      # При пуше тега вида v1.0.0 jar прикрепляется к GitHub Release
+      - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             build/libs/*.jar
             !build/libs/*-sources.jar
-            !build/libs/*-dev.jar
