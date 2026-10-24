@@ -1,7 +1,8 @@
 name: build
 
 # Самодостаточный workflow: весь код мода встроен в этот файл.
-# Положите его в .github/workflows/build.yml пустого репозитория и запустите (Actions -> build -> Run workflow).
+# Положите его в .github/workflows/build.yml репозитория и запустите (Actions -> build -> Run workflow).
+# Версии Fabric Loader / Loom / Fabric API определяются автоматически (с запасными значениями).
 # Этап 1: рабочий каркас + редактор слотов (хоткей K). Миксины на размер инвентаря добавим на этапе 2.
 
 on:
@@ -17,27 +18,39 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 25
 
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 9.7.0
+
+      - name: Resolve Fabric versions
+        run: |
+          MAVEN=https://maven.fabricmc.net/net/fabricmc
+          LOADER=$(curl -fsSL "$MAVEN/fabric-loader/maven-metadata.xml" | grep -oP '(?<=<release>)[^<]+' || true)
+          LOOM=$(curl -fsSL "$MAVEN/fabric-loom/net.fabricmc.fabric-loom.gradle.plugin/maven-metadata.xml" | grep -oP '(?<=<release>)[^<]+' || true)
+          API=$(curl -fsSL "$MAVEN/fabric-api/fabric-api/maven-metadata.xml" | grep -oP '(?<=<version>)[^<]+\+26\.2(?=</version>)' | tail -1 || true)
+          [ -n "$LOADER" ] || LOADER=0.19.5
+          [ -n "$LOOM" ] || LOOM=1.18.4
+          [ -n "$API" ] || API=0.161.0+26.2
+          echo "Loader=$LOADER Loom=$LOOM FabricAPI=$API"
+          echo "LOADER_VERSION=$LOADER" >> "$GITHUB_ENV"
+          echo "LOOM_VERSION=$LOOM" >> "$GITHUB_ENV"
+          echo "FABRIC_API_VERSION=$API" >> "$GITHUB_ENV"
 
       - name: Generate mod project
         run: |
-          cat > 'gradle.properties' <<'BIGSLOTS_EOF'
+          cat > 'gradle.properties' <<BIGSLOTS_EOF
           org.gradle.jvmargs=-Xmx2G
           org.gradle.parallel=true
           org.gradle.configuration-cache=false
 
           # Fabric (https://fabricmc.net/develop)
           minecraft_version=26.2
-          loader_version=0.19.5
-          loom_version=1.18.4
-          fabric_api_version=0.161.0+26.2
+          loader_version=${LOADER_VERSION}
+          loom_version=${LOOM_VERSION}
+          fabric_api_version=${FABRIC_API_VERSION}
 
           # Мод
           mod_version=1.0.0
@@ -199,7 +212,7 @@ jobs:
 
           /**
            * Режим редактирования слотов: всё мигает, обычным инвентарём пользоваться нельзя.
-           * ЛКМ по пустой клетке - добавить слот, ПКМ по слоту - убрать, кнопка "Готово" (ЛКМ) - подтвердить.
+           * ЛКМ по пустой клетке - добавить слот, ПКМ по слоту - убрать, кнопка "Подтвердить" (ЛКМ) - сохранить.
            */
           public class SlotEditorScreen extends Screen {
               private static final int CELL = 22;
@@ -216,8 +229,8 @@ jobs:
                   return this.width / 2 - (SlotLayout.COLS * CELL) / 2;
               }
 
-              private int top() {
-                  return this.height / 2 - 80;
+              private int gridTop() {
+                  return this.height / 2 - 80 + 20;
               }
 
               @Override
@@ -229,11 +242,11 @@ jobs:
                       int row = i / SlotLayout.COLS;
                       Button b = Button.builder(cellLabel(i, true), btn -> {
                           draft[idx] = true;
-                      }).bounds(left() + col * CELL, top() + 20 + row * CELL, CELL - 2, CELL - 2).build();
+                      }).bounds(left() + col * CELL, gridTop() + row * CELL, CELL - 2, CELL - 2).build();
                       cells[i] = this.addRenderableWidget(b);
                   }
 
-                  int below = top() + 20 + SlotLayout.ROWS * CELL + 8;
+                  int below = gridTop() + SlotLayout.ROWS * CELL + 8;
 
                   this.addRenderableWidget(Button.builder(Component.translatable("bigslots.menu.done"), b -> {
                       System.arraycopy(draft, 0, SlotLayout.enabled, 0, draft.length);
@@ -252,14 +265,18 @@ jobs:
                   return Component.literal("+").withColor(bright ? 0xFFFFFF : 0x777777);
               }
 
-              /** ПКМ по включённому слоту - удалить его (по одному). */
+              /** ПКМ по включённому слоту - удалить его (по одному). Клетка определяется по координатам. */
               @Override
               public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
                   if (event.button() == 1) {
-                      for (int i = 0; i < cells.length; i++) {
-                          Button b = cells[i];
-                          if (b != null && b.isMouseOver(event.x(), event.y())) {
-                              draft[i] = false;
+                      double dx = event.x() - left();
+                      double dy = event.y() - gridTop();
+                      if (dx >= 0 && dy >= 0) {
+                          int col = (int) (dx / CELL);
+                          int row = (int) (dy / CELL);
+                          boolean inside = (dx - col * CELL) < CELL - 2 && (dy - row * CELL) < CELL - 2;
+                          if (inside && col < SlotLayout.COLS && row < SlotLayout.ROWS) {
+                              draft[row * SlotLayout.COLS + col] = false;
                               return true;
                           }
                       }
@@ -280,9 +297,9 @@ jobs:
                   super.extractRenderState(graphics, mouseX, mouseY, delta);
 
                   int cx = this.width / 2;
-                  drawCentered(graphics, this.title.getString(), cx, top(), bright ? 0xFFFFFFFF : 0xFFFFAA00);
+                  drawCentered(graphics, this.title.getString(), cx, gridTop() - 20, bright ? 0xFFFFFFFF : 0xFFFFAA00);
                   drawCentered(graphics, Component.translatable("bigslots.menu.hint").getString(),
-                          cx, top() + 20 + SlotLayout.ROWS * CELL + 34, 0xFFA0A0A0);
+                          cx, gridTop() + SlotLayout.ROWS * CELL + 34, 0xFFA0A0A0);
               }
 
               private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
@@ -299,10 +316,39 @@ jobs:
           import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
           import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
           import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.screens.Screen;
           import org.lwjgl.glfw.GLFW;
 
           public class BigSlotsClient implements ClientModInitializer {
               private static KeyMapping editKey;
+
+              /**
+               * Метод открытия экрана переименовывали между версиями (setScreen / setScreenAndShow),
+               * поэтому ищем подходящий через рефлексию - так сборка не зависит от точного имени.
+               */
+              private static void openScreen(Minecraft client, Screen screen) {
+                  Object[] owners = new Object[2];
+                  owners[0] = client;
+                  try {
+                      owners[1] = Minecraft.class.getField("gui").get(client);
+                  } catch (ReflectiveOperationException e) {
+                      owners[1] = null;
+                  }
+                  for (Object owner : owners) {
+                      if (owner == null) {
+                          continue;
+                      }
+                      for (String name : new String[] {"setScreenAndShow", "setScreen"}) {
+                          try {
+                              owner.getClass().getMethod(name, Screen.class).invoke(owner, screen);
+                              return;
+                          } catch (ReflectiveOperationException e) {
+                              // пробуем следующий вариант
+                          }
+                      }
+                  }
+              }
 
               @Override
               public void onInitializeClient() {
@@ -321,9 +367,7 @@ jobs:
                           return;
                       }
                       while (editKey.consumeClick()) {
-                          if (client.gui.screen() == null) {
-                              client.gui.setScreen(new SlotEditorScreen());
-                          }
+                          openScreen(client, new SlotEditorScreen());
                       }
                   });
               }
