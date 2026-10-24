@@ -1,35 +1,400 @@
 name: build
 
+# Самодостаточный workflow: весь код мода встроен в этот файл.
+# Положите его в .github/workflows/build.yml пустого репозитория и запустите (Actions -> build -> Run workflow).
+# Этап 1: рабочий каркас + редактор слотов (хоткей K). Миксины на размер инвентаря добавим на этапе 2.
+
 on:
   push:
     branches: [ main, master ]
-  pull_request:
+    tags: [ 'v*' ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 25
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.7.0
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Generate mod project
+        run: |
+          cat > 'gradle.properties' <<'BIGSLOTS_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          org.gradle.configuration-cache=false
+
+          # Fabric (https://fabricmc.net/develop)
+          minecraft_version=26.2
+          loader_version=0.19.5
+          loom_version=1.18.4
+          fabric_api_version=0.161.0+26.2
+
+          # Мод
+          mod_version=1.0.0
+          maven_group=com.bigslots
+          archives_base_name=bigslots
+          BIGSLOTS_EOF
+          cat > 'settings.gradle' <<'BIGSLOTS_EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'build.gradle' <<'BIGSLOTS_EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          loom {
+              splitEnvironmentSourceSets()
+
+              mods {
+                  "bigslots" {
+                      sourceSet sourceSets.main
+                      sourceSet sourceSets.client
+                  }
+              }
+          }
+
+          dependencies {
+              // Minecraft 26.x не обфусцирован: маппинги и remap не нужны
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+              it.options.encoding = "UTF-8"
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          BIGSLOTS_EOF
+          mkdir -p 'src/main/java/com/bigslots'
+          cat > 'src/main/java/com/bigslots/BigSlots.java' <<'BIGSLOTS_EOF'
+          package com.bigslots;
+
+          import net.fabricmc.api.ModInitializer;
+          import net.minecraft.resources.Identifier;
+
+          public class BigSlots implements ModInitializer {
+              public static final String MOD_ID = "bigslots";
+
+              public static Identifier id(String path) {
+                  return Identifier.fromNamespaceAndPath(MOD_ID, path);
+              }
+
+              @Override
+              public void onInitialize() {
+                  // Этап 2: здесь появится логика расширенного инвентаря
+              }
+          }
+          BIGSLOTS_EOF
+          mkdir -p 'src/client/java/com/bigslots/client'
+          cat > 'src/client/java/com/bigslots/client/SlotLayout.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.client;
+
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          /** Раскладка дополнительных слотов: сетка ROWS x COLS, true = слот включён. Файл config/bigslots.properties. */
+          public final class SlotLayout {
+              public static final int ROWS = 4;
+              public static final int COLS = 9;
+              public static final int SIZE = ROWS * COLS;
+
+              public static final boolean[] enabled = new boolean[SIZE];
+
+              private SlotLayout() {
+              }
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("bigslots.properties");
+              }
+
+              public static void load() {
+                  Path path = file();
+                  if (!Files.exists(path)) {
+                      return;
+                  }
+                  Properties props = new Properties();
+                  try (Reader reader = Files.newBufferedReader(path)) {
+                      props.load(reader);
+                  } catch (IOException e) {
+                      return;
+                  }
+                  String s = props.getProperty("layout", "");
+                  for (int i = 0; i < SIZE; i++) {
+                      enabled[i] = i < s.length() && s.charAt(i) == '1';
+                  }
+              }
+
+              public static void save() {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = 0; i < SIZE; i++) {
+                      sb.append(enabled[i] ? '1' : '0');
+                  }
+                  Properties props = new Properties();
+                  props.setProperty("layout", sb.toString());
+                  try (Writer writer = Files.newBufferedWriter(file())) {
+                      props.store(writer, "Big Slots: 1 = slot enabled");
+                  } catch (IOException e) {
+                      // не критично: раскладка просто не сохранится на диск
+                  }
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/client/java/com/bigslots/client/SlotEditorScreen.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.client;
+
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.input.MouseButtonEvent;
+          import net.minecraft.network.chat.Component;
+
+          /**
+           * Режим редактирования слотов: всё мигает, обычным инвентарём пользоваться нельзя.
+           * ЛКМ по пустой клетке - добавить слот, ПКМ по слоту - убрать, кнопка "Готово" (ЛКМ) - подтвердить.
+           */
+          public class SlotEditorScreen extends Screen {
+              private static final int CELL = 22;
+
+              private final boolean[] draft = new boolean[SlotLayout.SIZE];
+              private final Button[] cells = new Button[SlotLayout.SIZE];
+
+              public SlotEditorScreen() {
+                  super(Component.translatable("bigslots.menu.title"));
+                  System.arraycopy(SlotLayout.enabled, 0, draft, 0, draft.length);
+              }
+
+              private int left() {
+                  return this.width / 2 - (SlotLayout.COLS * CELL) / 2;
+              }
+
+              private int top() {
+                  return this.height / 2 - 80;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = this.width / 2;
+                  for (int i = 0; i < SlotLayout.SIZE; i++) {
+                      final int idx = i;
+                      int col = i % SlotLayout.COLS;
+                      int row = i / SlotLayout.COLS;
+                      Button b = Button.builder(cellLabel(i, true), btn -> {
+                          draft[idx] = true;
+                      }).bounds(left() + col * CELL, top() + 20 + row * CELL, CELL - 2, CELL - 2).build();
+                      cells[i] = this.addRenderableWidget(b);
+                  }
+
+                  int below = top() + 20 + SlotLayout.ROWS * CELL + 8;
+
+                  this.addRenderableWidget(Button.builder(Component.translatable("bigslots.menu.done"), b -> {
+                      System.arraycopy(draft, 0, SlotLayout.enabled, 0, draft.length);
+                      SlotLayout.save();
+                      this.onClose();
+                  }).bounds(cx - 100, below, 98, 20).build());
+
+                  this.addRenderableWidget(Button.builder(Component.translatable("bigslots.menu.cancel"), b -> this.onClose())
+                          .bounds(cx + 2, below, 98, 20).build());
+              }
+
+              private Component cellLabel(int i, boolean bright) {
+                  if (draft[i]) {
+                      return Component.literal("O").withColor(bright ? 0x55FF55 : 0x00AA00);
+                  }
+                  return Component.literal("+").withColor(bright ? 0xFFFFFF : 0x777777);
+              }
+
+              /** ПКМ по включённому слоту - удалить его (по одному). */
+              @Override
+              public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+                  if (event.button() == 1) {
+                      for (int i = 0; i < cells.length; i++) {
+                          Button b = cells[i];
+                          if (b != null && b.isMouseOver(event.x(), event.y())) {
+                              draft[i] = false;
+                              return true;
+                          }
+                      }
+                  }
+                  return super.mouseClicked(event, doubleClick);
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+                  // мигание: переключается несколько раз в секунду
+                  boolean bright = (System.currentTimeMillis() / 350) % 2 == 0;
+                  for (int i = 0; i < cells.length; i++) {
+                      if (cells[i] != null) {
+                          cells[i].setMessage(cellLabel(i, bright));
+                      }
+                  }
+
+                  super.extractRenderState(graphics, mouseX, mouseY, delta);
+
+                  int cx = this.width / 2;
+                  drawCentered(graphics, this.title.getString(), cx, top(), bright ? 0xFFFFFFFF : 0xFFFFAA00);
+                  drawCentered(graphics, Component.translatable("bigslots.menu.hint").getString(),
+                          cx, top() + 20 + SlotLayout.ROWS * CELL + 34, 0xFFA0A0A0);
+              }
+
+              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
+                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/client/java/com/bigslots/client/BigSlotsClient.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.client;
+
+          import com.bigslots.BigSlots;
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.minecraft.client.KeyMapping;
+          import org.lwjgl.glfw.GLFW;
+
+          public class BigSlotsClient implements ClientModInitializer {
+              private static KeyMapping editKey;
+
+              @Override
+              public void onInitializeClient() {
+                  SlotLayout.load();
+
+                  KeyMapping.Category category = KeyMapping.Category.register(BigSlots.id("main"));
+
+                  editKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                          "key.bigslots.edit",
+                          InputConstants.Type.KEYSYM,
+                          GLFW.GLFW_KEY_K,
+                          category));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      if (client.player == null) {
+                          return;
+                      }
+                      while (editKey.consumeClick()) {
+                          if (client.gui.screen() == null) {
+                              client.gui.setScreen(new SlotEditorScreen());
+                          }
+                      }
+                  });
+              }
+          }
+          BIGSLOTS_EOF
+          mkdir -p 'src/main/resources/assets/bigslots/lang'
+          cat > 'src/main/resources/assets/bigslots/lang/en_us.json' <<'BIGSLOTS_EOF'
+          {
+            "key.bigslots.edit": "Edit extra slots",
+            "key.category.bigslots.main": "Big Slots",
+
+            "bigslots.menu.title": "Slot editor",
+            "bigslots.menu.done": "Confirm",
+            "bigslots.menu.cancel": "Cancel",
+            "bigslots.menu.hint": "LMB on + : add slot. RMB on O : remove slot."
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/resources/assets/bigslots/lang/ru_ru.json' <<'BIGSLOTS_EOF'
+          {
+            "key.bigslots.edit": "Редактировать доп. слоты",
+            "key.category.bigslots.main": "Big Slots",
+
+            "bigslots.menu.title": "Редактор слотов",
+            "bigslots.menu.done": "Подтвердить",
+            "bigslots.menu.cancel": "Отмена",
+            "bigslots.menu.hint": "ЛКМ по + : добавить слот. ПКМ по O : удалить слот."
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/resources/fabric.mod.json' <<'BIGSLOTS_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "bigslots",
+            "version": "${version}",
+            "name": "Big Slots",
+            "description": "Больше слотов в инвентаре и хотбаре без дополнительных предметов. Редактор слотов по хоткею.",
+            "authors": [],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": [
+                "com.bigslots.BigSlots"
+              ],
+              "client": [
+                "com.bigslots.client.BigSlotsClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.3",
+              "minecraft": "~26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          BIGSLOTS_EOF
 
       - name: Build
-        run: ./gradlew build
+        run: gradle build --stacktrace
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: mod-jar
-          path: build/libs/*.jar
+          name: bigslots
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+
+      # При пуше тега вида v1.0.0 jar прикрепляется к GitHub Release
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
