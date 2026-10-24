@@ -2,8 +2,8 @@ name: build
 
 # Самодостаточный workflow: весь код мода встроен в этот файл.
 # Положите его в .github/workflows/build.yml репозитория и запустите (Actions -> build -> Run workflow).
+# Этап 2: 36 дополнительных слотов прямо в экране инвентаря + режим редактирования по клавише K.
 # Версии Fabric Loader / Loom / Fabric API определяются автоматически (с запасными значениями).
-# Этап 1: рабочий каркас + редактор слотов (хоткей K). Миксины на размер инвентаря добавим на этапе 2.
 
 on:
   push:
@@ -53,7 +53,7 @@ jobs:
           fabric_api_version=${FABRIC_API_VERSION}
 
           # Мод
-          mod_version=1.0.0
+          mod_version=2.0.0
           maven_group=com.bigslots
           archives_base_name=bigslots
           BIGSLOTS_EOF
@@ -123,14 +123,167 @@ jobs:
           }
           BIGSLOTS_EOF
           mkdir -p 'src/main/java/com/bigslots'
+          cat > 'src/main/java/com/bigslots/BigSlotsPlayer.java' <<'BIGSLOTS_EOF'
+          package com.bigslots;
+
+          import net.minecraft.world.SimpleContainer;
+
+          /** Дополнительные данные игрока (реализуется миксином на Player). */
+          public interface BigSlotsPlayer {
+              /** Контейнер дополнительных слотов. */
+              SimpleContainer bigslots$getExtra();
+
+              boolean bigslots$isEnabled(int index);
+
+              void bigslots$setEnabled(int index, boolean enabled);
+
+              long bigslots$getDisabledMask();
+
+              void bigslots$setDisabledMask(long mask);
+
+              /** Включён ли режим редактирования слотов. */
+              boolean bigslots$isEdit();
+
+              void bigslots$setEdit(boolean edit);
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/ExtraSlot.java' <<'BIGSLOTS_EOF'
+          package com.bigslots;
+
+          import net.minecraft.world.Container;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.Slot;
+          import net.minecraft.world.item.ItemStack;
+
+          /** Дополнительный слот инвентаря. Отключённый слот скрыт и недоступен; в режиме редактирования виден всегда. */
+          public class ExtraSlot extends Slot {
+              private final BigSlotsPlayer owner;
+              private final int idx;
+
+              public ExtraSlot(Container container, int index, int x, int y, BigSlotsPlayer owner) {
+                  super(container, index, x, y);
+                  this.owner = owner;
+                  this.idx = index;
+              }
+
+              public int idx() {
+                  return idx;
+              }
+
+              public boolean isEnabled() {
+                  return owner.bigslots$isEnabled(idx);
+              }
+
+              @Override
+              public boolean isActive() {
+                  return isEnabled() || owner.bigslots$isEdit();
+              }
+
+              @Override
+              public boolean mayPlace(ItemStack stack) {
+                  return isEnabled() && !owner.bigslots$isEdit();
+              }
+
+              @Override
+              public boolean mayPickup(Player player) {
+                  return isEnabled() && !owner.bigslots$isEdit();
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/MaskDataSlot.java' <<'BIGSLOTS_EOF'
+          package com.bigslots;
+
+          import net.minecraft.world.inventory.DataSlot;
+
+          /**
+           * Синхронизация "слот выключен" между сервером и клиентом (0 = включён, это значение по умолчанию на обеих сторонах).
+           */
+          public class MaskDataSlot extends DataSlot {
+              private final BigSlotsPlayer owner;
+              private final int idx;
+
+              public MaskDataSlot(BigSlotsPlayer owner, int idx) {
+                  this.owner = owner;
+                  this.idx = idx;
+              }
+
+              @Override
+              public int get() {
+                  return owner.bigslots$isEnabled(idx) ? 0 : 1;
+              }
+
+              @Override
+              public void set(int value) {
+                  owner.bigslots$setEnabled(idx, value == 0);
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/EditDataSlot.java' <<'BIGSLOTS_EOF'
+          package com.bigslots;
+
+          import net.minecraft.world.inventory.DataSlot;
+
+          /** Синхронизация режима редактирования между сервером и клиентом. */
+          public class EditDataSlot extends DataSlot {
+              private final BigSlotsPlayer owner;
+
+              public EditDataSlot(BigSlotsPlayer owner) {
+                  this.owner = owner;
+              }
+
+              @Override
+              public int get() {
+                  return owner.bigslots$isEdit() ? 1 : 0;
+              }
+
+              @Override
+              public void set(int value) {
+                  owner.bigslots$setEdit(value != 0);
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/EditPayload.java' <<'BIGSLOTS_EOF'
+          package com.bigslots;
+
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+          /** Клиент -> сервер: переключить режим редактирования слотов (action = 0). */
+          public record EditPayload(int action, int arg) implements CustomPacketPayload {
+
+              public static final CustomPacketPayload.Type<EditPayload> TYPE =
+                      new CustomPacketPayload.Type<>(BigSlots.id("edit"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, EditPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.VAR_INT, EditPayload::action,
+                      ByteBufCodecs.VAR_INT, EditPayload::arg,
+                      EditPayload::new);
+
+              @Override
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          BIGSLOTS_EOF
           cat > 'src/main/java/com/bigslots/BigSlots.java' <<'BIGSLOTS_EOF'
           package com.bigslots;
 
           import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.network.chat.Component;
           import net.minecraft.resources.Identifier;
+          import net.minecraft.server.level.ServerPlayer;
 
           public class BigSlots implements ModInitializer {
               public static final String MOD_ID = "bigslots";
+
+              /** Дополнительные слоты: 9 строк по 4 колонки справа от инвентаря. */
+              public static final int EXTRA_ROWS = 9;
+              public static final int EXTRA_COLS = 4;
+              public static final int EXTRA = EXTRA_ROWS * EXTRA_COLS;
 
               public static Identifier id(String path) {
                   return Identifier.fromNamespaceAndPath(MOD_ID, path);
@@ -138,222 +291,406 @@ jobs:
 
               @Override
               public void onInitialize() {
-                  // Этап 2: здесь появится логика расширенного инвентаря
+                  PayloadTypeRegistry.serverboundPlay().register(EditPayload.TYPE, EditPayload.CODEC);
+
+                  ServerPlayNetworking.registerGlobalReceiver(EditPayload.TYPE, (payload, context) -> {
+                      ServerPlayer player = context.player();
+                      if (player instanceof BigSlotsPlayer bp) {
+                          boolean now = !bp.bigslots$isEdit();
+                          bp.bigslots$setEdit(now);
+                          player.sendSystemMessage(Component.translatable(now ? "bigslots.edit.on" : "bigslots.edit.off"));
+                      }
+                  });
+              }
+          }
+          BIGSLOTS_EOF
+          mkdir -p 'src/main/java/com/bigslots/mixin'
+          cat > 'src/main/java/com/bigslots/mixin/PlayerMixin.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.mixin;
+
+          import com.bigslots.BigSlots;
+          import com.bigslots.BigSlotsPlayer;
+          import net.minecraft.world.ItemStackWithSlot;
+          import net.minecraft.world.SimpleContainer;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.level.storage.ValueInput;
+          import net.minecraft.world.level.storage.ValueOutput;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Unique;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          /** Хранит у игрока контейнер доп. слотов, раскладку (какие слоты выключены) и флаг режима редактирования. */
+          @Mixin(Player.class)
+          public abstract class PlayerMixin implements BigSlotsPlayer {
+              @Unique
+              private SimpleContainer bigslots$extra;
+              @Unique
+              private long bigslots$disabled = 0L;
+              @Unique
+              private boolean bigslots$edit = false;
+
+              @Override
+              public SimpleContainer bigslots$getExtra() {
+                  // лениво: меню инвентаря создаётся в конструкторе Player раньше, чем отработали бы инициализаторы
+                  if (this.bigslots$extra == null) {
+                      this.bigslots$extra = new SimpleContainer(BigSlots.EXTRA);
+                  }
+                  return this.bigslots$extra;
+              }
+
+              @Override
+              public boolean bigslots$isEnabled(int index) {
+                  return (this.bigslots$disabled & (1L << index)) == 0L;
+              }
+
+              @Override
+              public void bigslots$setEnabled(int index, boolean enabled) {
+                  if (enabled) {
+                      this.bigslots$disabled &= ~(1L << index);
+                  } else {
+                      this.bigslots$disabled |= (1L << index);
+                  }
+              }
+
+              @Override
+              public long bigslots$getDisabledMask() {
+                  return this.bigslots$disabled;
+              }
+
+              @Override
+              public void bigslots$setDisabledMask(long mask) {
+                  this.bigslots$disabled = mask;
+              }
+
+              @Override
+              public boolean bigslots$isEdit() {
+                  return this.bigslots$edit;
+              }
+
+              @Override
+              public void bigslots$setEdit(boolean edit) {
+                  this.bigslots$edit = edit;
+              }
+
+              @Inject(method = "addAdditionalSaveData(Lnet/minecraft/world/level/storage/ValueOutput;)V", at = @At("TAIL"))
+              private void bigslots$save(ValueOutput output, CallbackInfo ci) {
+                  output.putLong("BigSlotsDisabled", this.bigslots$disabled);
+                  SimpleContainer extra = this.bigslots$getExtra();
+                  var list = output.list("BigSlotsItems", ItemStackWithSlot.CODEC);
+                  for (int i = 0; i < extra.getContainerSize(); i++) {
+                      ItemStack stack = extra.getItem(i);
+                      if (!stack.isEmpty()) {
+                          list.add(new ItemStackWithSlot(i, stack));
+                      }
+                  }
+              }
+
+              @Inject(method = "readAdditionalSaveData(Lnet/minecraft/world/level/storage/ValueInput;)V", at = @At("TAIL"))
+              private void bigslots$load(ValueInput input, CallbackInfo ci) {
+                  this.bigslots$disabled = input.getLongOr("BigSlotsDisabled", 0L);
+                  SimpleContainer extra = this.bigslots$getExtra();
+                  for (var entry : input.listOrEmpty("BigSlotsItems", ItemStackWithSlot.CODEC)) {
+                      int slot = entry.slot();
+                      if (slot >= 0 && slot < extra.getContainerSize()) {
+                          extra.setItem(slot, entry.stack());
+                      }
+                  }
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/mixin/InventoryMixin.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.mixin;
+
+          import com.bigslots.BigSlotsPlayer;
+          import net.minecraft.world.SimpleContainer;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.ItemStack;
+          import org.spongepowered.asm.mixin.Final;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Shadow;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          /** При смерти (без keepInventory) предметы из доп. слотов выпадают вместе с обычными. */
+          @Mixin(Inventory.class)
+          public abstract class InventoryMixin {
+              @Shadow
+              @Final
+              public Player player;
+
+              @Inject(method = "dropAll()V", at = @At("HEAD"))
+              private void bigslots$dropExtra(CallbackInfo ci) {
+                  if (this.player.level().isClientSide()) {
+                      return;
+                  }
+                  if (this.player instanceof BigSlotsPlayer bp) {
+                      SimpleContainer extra = bp.bigslots$getExtra();
+                      for (int i = 0; i < extra.getContainerSize(); i++) {
+                          ItemStack stack = extra.getItem(i);
+                          if (!stack.isEmpty()) {
+                              this.player.drop(stack, true);
+                              extra.setItem(i, ItemStack.EMPTY);
+                          }
+                      }
+                  }
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/mixin/InventoryMenuMixin.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.mixin;
+
+          import com.bigslots.BigSlots;
+          import com.bigslots.BigSlotsPlayer;
+          import com.bigslots.EditDataSlot;
+          import com.bigslots.ExtraSlot;
+          import com.bigslots.MaskDataSlot;
+          import net.minecraft.world.SimpleContainer;
+          import net.minecraft.world.entity.player.Inventory;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.AbstractContainerMenu;
+          import net.minecraft.world.inventory.InventoryMenu;
+          import net.minecraft.world.inventory.MenuType;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          /** Добавляет дополнительные слоты в конец меню инвентаря игрока (индексы после ванильных, поэтому ваниль не ломается). */
+          @Mixin(InventoryMenu.class)
+          public abstract class InventoryMenuMixin extends AbstractContainerMenu {
+              protected InventoryMenuMixin(MenuType<?> menuType, int containerId) {
+                  super(menuType, containerId);
+              }
+
+              @Inject(method = "<init>(Lnet/minecraft/world/entity/player/Inventory;ZLnet/minecraft/world/entity/player/Player;)V",
+                      at = @At("TAIL"))
+              private void bigslots$addSlots(Inventory inventory, boolean active, Player owner, CallbackInfo ci) {
+                  if (!(owner instanceof BigSlotsPlayer bp)) {
+                      return;
+                  }
+                  SimpleContainer extra = bp.bigslots$getExtra();
+                  for (int i = 0; i < BigSlots.EXTRA; i++) {
+                      int col = i % BigSlots.EXTRA_COLS;
+                      int row = i / BigSlots.EXTRA_COLS;
+                      // справа от панели инвентаря (ширина панели 176)
+                      this.addSlot(new ExtraSlot(extra, i, 182 + col * 18, 8 + row * 18, bp));
+                  }
+                  for (int i = 0; i < BigSlots.EXTRA; i++) {
+                      this.addDataSlot(new MaskDataSlot(bp, i));
+                  }
+                  this.addDataSlot(new EditDataSlot(bp));
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/mixin/AbstractContainerMenuMixin.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.mixin;
+
+          import com.bigslots.BigSlotsPlayer;
+          import com.bigslots.ExtraSlot;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.AbstractContainerMenu;
+          import net.minecraft.world.inventory.ContainerInput;
+          import net.minecraft.world.inventory.InventoryMenu;
+          import net.minecraft.world.inventory.Slot;
+          import net.minecraft.world.item.ItemStack;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          /**
+           * Режим редактирования: обычные клики по инвентарю блокируются.
+           * ЛКМ по выключенному слоту - включить, ПКМ по включённому - убрать (предметы возвращаются игроку).
+           */
+          @Mixin(AbstractContainerMenu.class)
+          public abstract class AbstractContainerMenuMixin {
+              @Inject(method = "clicked(IILnet/minecraft/world/inventory/ContainerInput;Lnet/minecraft/world/entity/player/Player;)V",
+                      at = @At("HEAD"), cancellable = true)
+              private void bigslots$editClick(int slotId, int button, ContainerInput input, Player player, CallbackInfo ci) {
+                  AbstractContainerMenu self = (AbstractContainerMenu) (Object) this;
+                  if (!(self instanceof InventoryMenu)) {
+                      return;
+                  }
+                  if (!(player instanceof BigSlotsPlayer bp) || !bp.bigslots$isEdit()) {
+                      return;
+                  }
+
+                  // в режиме редактирования инвентарём пользоваться нельзя
+                  ci.cancel();
+
+                  if (player.level().isClientSide()) {
+                      return; // раскладку подтверждает сервер, клиент получит её синхронизацией
+                  }
+                  if (!"PICKUP".equals(String.valueOf(input))) {
+                      return;
+                  }
+                  if (slotId < 0 || slotId >= self.slots.size()) {
+                      return;
+                  }
+                  Slot slot = self.slots.get(slotId);
+                  if (!(slot instanceof ExtraSlot extra)) {
+                      return;
+                  }
+
+                  if (button == 0 && !extra.isEnabled()) {
+                      bp.bigslots$setEnabled(extra.idx(), true);
+                  } else if (button == 1 && extra.isEnabled()) {
+                      ItemStack stack = extra.getItem().copy();
+                      extra.set(ItemStack.EMPTY);
+                      bp.bigslots$setEnabled(extra.idx(), false);
+                      if (!stack.isEmpty()) {
+                          player.getInventory().placeItemBackInInventory(stack);
+                      }
+                  }
+              }
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/java/com/bigslots/mixin/ServerPlayerMixin.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.mixin;
+
+          import com.bigslots.BigSlotsPlayer;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.SimpleContainer;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          /** При возрождении/смене экземпляра игрока переносим раскладку и содержимое доп. слотов. */
+          @Mixin(ServerPlayer.class)
+          public abstract class ServerPlayerMixin {
+              @Inject(method = "restoreFrom(Lnet/minecraft/server/level/ServerPlayer;Z)V", at = @At("TAIL"), require = 0)
+              private void bigslots$copy(ServerPlayer old, boolean alive, CallbackInfo ci) {
+                  if (old instanceof BigSlotsPlayer from && (Object) this instanceof BigSlotsPlayer to) {
+                      to.bigslots$setDisabledMask(from.bigslots$getDisabledMask());
+                      SimpleContainer a = from.bigslots$getExtra();
+                      SimpleContainer b = to.bigslots$getExtra();
+                      for (int i = 0; i < a.getContainerSize() && i < b.getContainerSize(); i++) {
+                          b.setItem(i, a.getItem(i));
+                      }
+                  }
+              }
+          }
+          BIGSLOTS_EOF
+          mkdir -p 'src/client/java/com/bigslots/mixin'
+          cat > 'src/client/java/com/bigslots/mixin/AbstractContainerScreenMixin.java' <<'BIGSLOTS_EOF'
+          package com.bigslots.mixin;
+
+          import com.bigslots.BigSlotsPlayer;
+          import com.bigslots.ExtraSlot;
+          import com.bigslots.client.BigSlotsClient;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.input.KeyEvent;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.inventory.Slot;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          /**
+           * Клиентская часть: рамки доп. слотов, мигание всего инвентаря в режиме редактирования
+           * и обработка хоткея прямо внутри экрана инвентаря.
+           * Цели указаны с полными дескрипторами и require = 0: если имя метода в 26.2 другое, мод не падает,
+           * а просто не рисует рамки / не ловит клавишу внутри экрана (клавиша всё равно работает в мире).
+           */
+          @Mixin(targets = "net.minecraft.client.gui.screens.inventory.AbstractContainerScreen")
+          public abstract class AbstractContainerScreenMixin {
+
+              @Inject(method = "extractSlot(Lnet/minecraft/client/gui/GuiGraphicsExtractor;Lnet/minecraft/world/inventory/Slot;II)V",
+                      at = @At("HEAD"), require = 0)
+              private void bigslots$frame(GuiGraphicsExtractor graphics, Slot slot, int mouseX, int mouseY, CallbackInfo ci) {
+                  Player player = Minecraft.getInstance().player;
+                  if (!(player instanceof BigSlotsPlayer bp)) {
+                      return;
+                  }
+                  int x = slot.x;
+                  int y = slot.y;
+
+                  if (slot instanceof ExtraSlot extra) {
+                      boolean on = extra.isEnabled();
+                      graphics.fill(x - 1, y - 1, x + 17, y + 17, 0xFF373737);
+                      graphics.fill(x, y, x + 16, y + 16, on ? 0xFF8B8B8B : 0xFF4A4A4A);
+                      if (!on) {
+                          // выключенный слот в режиме редактирования: зелёный плюс (ЛКМ - добавить)
+                          graphics.fill(x + 7, y + 3, x + 9, y + 13, 0xFF55FF55);
+                          graphics.fill(x + 3, y + 7, x + 13, y + 9, 0xFF55FF55);
+                      }
+                  }
+
+                  if (bp.bigslots$isEdit()) {
+                      // мигание всех слотов
+                      int alpha = 30 + (int) (70 * (0.5 + 0.5 * Math.sin(System.currentTimeMillis() / 150.0)));
+                      graphics.fill(x, y, x + 16, y + 16, (alpha << 24) | 0x00FFFFFF);
+                  }
+              }
+
+              @Inject(method = "keyPressed(Lnet/minecraft/client/input/KeyEvent;)Z",
+                      at = @At("HEAD"), cancellable = true, require = 0)
+              private void bigslots$hotkey(KeyEvent event, CallbackInfoReturnable<Boolean> cir) {
+                  String name = ((Object) this).getClass().getName();
+                  if (name.endsWith(".InventoryScreen") && BigSlotsClient.keyMatches(event)) {
+                      BigSlotsClient.pressEdit();
+                      cir.setReturnValue(true);
+                  }
               }
           }
           BIGSLOTS_EOF
           mkdir -p 'src/client/java/com/bigslots/client'
-          cat > 'src/client/java/com/bigslots/client/SlotLayout.java' <<'BIGSLOTS_EOF'
-          package com.bigslots.client;
-
-          import java.io.IOException;
-          import java.io.Reader;
-          import java.io.Writer;
-          import java.nio.file.Files;
-          import java.nio.file.Path;
-          import java.util.Properties;
-          import net.fabricmc.loader.api.FabricLoader;
-
-          /** Раскладка дополнительных слотов: сетка ROWS x COLS, true = слот включён. Файл config/bigslots.properties. */
-          public final class SlotLayout {
-              public static final int ROWS = 4;
-              public static final int COLS = 9;
-              public static final int SIZE = ROWS * COLS;
-
-              public static final boolean[] enabled = new boolean[SIZE];
-
-              private SlotLayout() {
-              }
-
-              private static Path file() {
-                  return FabricLoader.getInstance().getConfigDir().resolve("bigslots.properties");
-              }
-
-              public static void load() {
-                  Path path = file();
-                  if (!Files.exists(path)) {
-                      return;
-                  }
-                  Properties props = new Properties();
-                  try (Reader reader = Files.newBufferedReader(path)) {
-                      props.load(reader);
-                  } catch (IOException e) {
-                      return;
-                  }
-                  String s = props.getProperty("layout", "");
-                  for (int i = 0; i < SIZE; i++) {
-                      enabled[i] = i < s.length() && s.charAt(i) == '1';
-                  }
-              }
-
-              public static void save() {
-                  StringBuilder sb = new StringBuilder();
-                  for (int i = 0; i < SIZE; i++) {
-                      sb.append(enabled[i] ? '1' : '0');
-                  }
-                  Properties props = new Properties();
-                  props.setProperty("layout", sb.toString());
-                  try (Writer writer = Files.newBufferedWriter(file())) {
-                      props.store(writer, "Big Slots: 1 = slot enabled");
-                  } catch (IOException e) {
-                      // не критично: раскладка просто не сохранится на диск
-                  }
-              }
-          }
-          BIGSLOTS_EOF
-          cat > 'src/client/java/com/bigslots/client/SlotEditorScreen.java' <<'BIGSLOTS_EOF'
-          package com.bigslots.client;
-
-          import net.minecraft.client.gui.GuiGraphicsExtractor;
-          import net.minecraft.client.gui.components.Button;
-          import net.minecraft.client.gui.screens.Screen;
-          import net.minecraft.client.input.MouseButtonEvent;
-          import net.minecraft.network.chat.Component;
-
-          /**
-           * Режим редактирования слотов: всё мигает, обычным инвентарём пользоваться нельзя.
-           * ЛКМ по пустой клетке - добавить слот, ПКМ по слоту - убрать, кнопка "Подтвердить" (ЛКМ) - сохранить.
-           */
-          public class SlotEditorScreen extends Screen {
-              private static final int CELL = 22;
-
-              private final boolean[] draft = new boolean[SlotLayout.SIZE];
-              private final Button[] cells = new Button[SlotLayout.SIZE];
-
-              public SlotEditorScreen() {
-                  super(Component.translatable("bigslots.menu.title"));
-                  System.arraycopy(SlotLayout.enabled, 0, draft, 0, draft.length);
-              }
-
-              private int left() {
-                  return this.width / 2 - (SlotLayout.COLS * CELL) / 2;
-              }
-
-              private int gridTop() {
-                  return this.height / 2 - 80 + 20;
-              }
-
-              @Override
-              protected void init() {
-                  int cx = this.width / 2;
-                  for (int i = 0; i < SlotLayout.SIZE; i++) {
-                      final int idx = i;
-                      int col = i % SlotLayout.COLS;
-                      int row = i / SlotLayout.COLS;
-                      Button b = Button.builder(cellLabel(i, true), btn -> {
-                          draft[idx] = true;
-                      }).bounds(left() + col * CELL, gridTop() + row * CELL, CELL - 2, CELL - 2).build();
-                      cells[i] = this.addRenderableWidget(b);
-                  }
-
-                  int below = gridTop() + SlotLayout.ROWS * CELL + 8;
-
-                  this.addRenderableWidget(Button.builder(Component.translatable("bigslots.menu.done"), b -> {
-                      System.arraycopy(draft, 0, SlotLayout.enabled, 0, draft.length);
-                      SlotLayout.save();
-                      this.onClose();
-                  }).bounds(cx - 100, below, 98, 20).build());
-
-                  this.addRenderableWidget(Button.builder(Component.translatable("bigslots.menu.cancel"), b -> this.onClose())
-                          .bounds(cx + 2, below, 98, 20).build());
-              }
-
-              private Component cellLabel(int i, boolean bright) {
-                  if (draft[i]) {
-                      return Component.literal("O").withColor(bright ? 0x55FF55 : 0x00AA00);
-                  }
-                  return Component.literal("+").withColor(bright ? 0xFFFFFF : 0x777777);
-              }
-
-              /** ПКМ по включённому слоту - удалить его (по одному). Клетка определяется по координатам. */
-              @Override
-              public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
-                  if (event.button() == 1) {
-                      double dx = event.x() - left();
-                      double dy = event.y() - gridTop();
-                      if (dx >= 0 && dy >= 0) {
-                          int col = (int) (dx / CELL);
-                          int row = (int) (dy / CELL);
-                          boolean inside = (dx - col * CELL) < CELL - 2 && (dy - row * CELL) < CELL - 2;
-                          if (inside && col < SlotLayout.COLS && row < SlotLayout.ROWS) {
-                              draft[row * SlotLayout.COLS + col] = false;
-                              return true;
-                          }
-                      }
-                  }
-                  return super.mouseClicked(event, doubleClick);
-              }
-
-              @Override
-              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
-                  // мигание: переключается несколько раз в секунду
-                  boolean bright = (System.currentTimeMillis() / 350) % 2 == 0;
-                  for (int i = 0; i < cells.length; i++) {
-                      if (cells[i] != null) {
-                          cells[i].setMessage(cellLabel(i, bright));
-                      }
-                  }
-
-                  super.extractRenderState(graphics, mouseX, mouseY, delta);
-
-                  int cx = this.width / 2;
-                  drawCentered(graphics, this.title.getString(), cx, gridTop() - 20, bright ? 0xFFFFFFFF : 0xFFFFAA00);
-                  drawCentered(graphics, Component.translatable("bigslots.menu.hint").getString(),
-                          cx, gridTop() + SlotLayout.ROWS * CELL + 34, 0xFFA0A0A0);
-              }
-
-              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
-                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
-              }
-          }
-          BIGSLOTS_EOF
           cat > 'src/client/java/com/bigslots/client/BigSlotsClient.java' <<'BIGSLOTS_EOF'
           package com.bigslots.client;
 
           import com.bigslots.BigSlots;
+          import com.bigslots.EditPayload;
           import com.mojang.blaze3d.platform.InputConstants;
+          import java.lang.reflect.Method;
           import net.fabricmc.api.ClientModInitializer;
           import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
           import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
           import net.minecraft.client.KeyMapping;
-          import net.minecraft.client.Minecraft;
-          import net.minecraft.client.gui.screens.Screen;
           import org.lwjgl.glfw.GLFW;
 
           public class BigSlotsClient implements ClientModInitializer {
               private static KeyMapping editKey;
 
-              /**
-               * Метод открытия экрана переименовывали между версиями (setScreen / setScreenAndShow),
-               * поэтому ищем подходящий через рефлексию - так сборка не зависит от точного имени.
-               */
-              private static void openScreen(Minecraft client, Screen screen) {
-                  Object[] owners = new Object[2];
-                  owners[0] = client;
-                  try {
-                      owners[1] = Minecraft.class.getField("gui").get(client);
-                  } catch (ReflectiveOperationException e) {
-                      owners[1] = null;
+              /** Просит сервер переключить режим редактирования слотов. */
+              public static void pressEdit() {
+                  if (ClientPlayNetworking.canSend(EditPayload.TYPE)) {
+                      ClientPlayNetworking.send(new EditPayload(0, 0));
                   }
-                  for (Object owner : owners) {
-                      if (owner == null) {
-                          continue;
-                      }
-                      for (String name : new String[] {"setScreenAndShow", "setScreen"}) {
+              }
+
+              /**
+               * Совпадает ли событие клавиши с нашим хоткеем. Через рефлексию, чтобы сборка не зависела
+               * от точной сигнатуры KeyMapping.matches в этой версии.
+               */
+              public static boolean keyMatches(Object event) {
+                  if (editKey == null) {
+                      return false;
+                  }
+                  for (Method m : KeyMapping.class.getMethods()) {
+                      if (m.getName().equals("matches") && m.getParameterCount() == 1
+                              && m.getParameterTypes()[0].isInstance(event)) {
                           try {
-                              owner.getClass().getMethod(name, Screen.class).invoke(owner, screen);
-                              return;
+                              return (Boolean) m.invoke(editKey, event);
                           } catch (ReflectiveOperationException e) {
-                              // пробуем следующий вариант
+                              return false;
                           }
                       }
                   }
+                  return false;
               }
 
               @Override
               public void onInitializeClient() {
-                  SlotLayout.load();
-
                   KeyMapping.Category category = KeyMapping.Category.register(BigSlots.id("main"));
 
                   editKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
@@ -367,7 +704,7 @@ jobs:
                           return;
                       }
                       while (editKey.consumeClick()) {
-                          openScreen(client, new SlotEditorScreen());
+                          pressEdit();
                       }
                   });
               }
@@ -376,24 +713,41 @@ jobs:
           mkdir -p 'src/main/resources/assets/bigslots/lang'
           cat > 'src/main/resources/assets/bigslots/lang/en_us.json' <<'BIGSLOTS_EOF'
           {
-            "key.bigslots.edit": "Edit extra slots",
+            "key.bigslots.edit": "Slot edit mode",
             "key.category.bigslots.main": "Big Slots",
 
-            "bigslots.menu.title": "Slot editor",
-            "bigslots.menu.done": "Confirm",
-            "bigslots.menu.cancel": "Cancel",
-            "bigslots.menu.hint": "LMB on + : add slot. RMB on O : remove slot."
+            "bigslots.edit.on": "Slot edit mode: ON (LMB on + adds a slot, RMB removes a slot, press the key again to exit)",
+            "bigslots.edit.off": "Slot edit mode: OFF"
           }
           BIGSLOTS_EOF
           cat > 'src/main/resources/assets/bigslots/lang/ru_ru.json' <<'BIGSLOTS_EOF'
           {
-            "key.bigslots.edit": "Редактировать доп. слоты",
+            "key.bigslots.edit": "Режим редактирования слотов",
             "key.category.bigslots.main": "Big Slots",
 
-            "bigslots.menu.title": "Редактор слотов",
-            "bigslots.menu.done": "Подтвердить",
-            "bigslots.menu.cancel": "Отмена",
-            "bigslots.menu.hint": "ЛКМ по + : добавить слот. ПКМ по O : удалить слот."
+            "bigslots.edit.on": "Режим редактирования слотов: ВКЛ (ЛКМ по + добавляет слот, ПКМ убирает слот, ещё раз клавиша — выход)",
+            "bigslots.edit.off": "Режим редактирования слотов: ВЫКЛ"
+          }
+          BIGSLOTS_EOF
+          cat > 'src/main/resources/bigslots.mixins.json' <<'BIGSLOTS_EOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "com.bigslots.mixin",
+            "compatibilityLevel": "JAVA_25",
+            "mixins": [
+              "PlayerMixin",
+              "InventoryMixin",
+              "InventoryMenuMixin",
+              "AbstractContainerMenuMixin",
+              "ServerPlayerMixin"
+            ],
+            "client": [
+              "AbstractContainerScreenMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
           }
           BIGSLOTS_EOF
           cat > 'src/main/resources/fabric.mod.json' <<'BIGSLOTS_EOF'
@@ -402,7 +756,7 @@ jobs:
             "id": "bigslots",
             "version": "${version}",
             "name": "Big Slots",
-            "description": "Больше слотов в инвентаре и хотбаре без дополнительных предметов. Редактор слотов по хоткею.",
+            "description": "Больше слотов в инвентаре без дополнительных предметов. Режим редактирования слотов прямо в инвентаре.",
             "authors": [],
             "license": "MIT",
             "environment": "*",
@@ -414,6 +768,9 @@ jobs:
                 "com.bigslots.client.BigSlotsClient"
               ]
             },
+            "mixins": [
+              "bigslots.mixins.json"
+            ],
             "depends": {
               "fabricloader": ">=0.19.3",
               "minecraft": "~26.2",
@@ -426,36 +783,37 @@ jobs:
       - name: Build
         run: gradle build --stacktrace
 
-      # Диагностика для этапа 2: выводит реальные сигнатуры классов инвентаря Minecraft 26.2,
-      # чтобы миксины писались по фактам, а не наугад. Результат: артефакт "signatures" и лог шага.
+      # Диагностика: реальные сигнатуры классов Minecraft 26.2 (серверные и клиентские).
+      # Нужна, чтобы доработки (хотбар, рамки) писались по фактам. Результат: артефакт "signatures".
       - name: Dump Minecraft class signatures
         if: always()
         run: |
-          JAR=""
+          CP=""
           for j in $(find "$HOME/.gradle" "$GITHUB_WORKSPACE/.gradle" -name '*.jar' -size +5M 2>/dev/null); do
-            if unzip -l "$j" 2>/dev/null | grep -q 'net/minecraft/world/entity/player/Inventory.class'; then
-              JAR="$j"
-              break
+            if unzip -l "$j" 2>/dev/null | grep -q -E 'net/minecraft/(world/entity/player/Inventory|client/gui/screens/inventory/InventoryScreen)\.class'; then
+              CP="$CP:$j"
             fi
           done
+          CP="${CP#:}"
+          dump() { echo "===== $1"; javap -p -cp "$CP" "$1" 2>&1; }
+          dumpf() { echo "===== $1 (filtered: $2)"; javap -p -cp "$CP" "$1" 2>&1 | grep -E "$2" || true; }
           {
-            echo "Minecraft jar: $JAR"
-            if [ -n "$JAR" ]; then
-              echo "===== classes (names)"
-              unzip -l "$JAR" | grep -i -E 'Hotbar|InventoryMenu|InventoryScreen|player/Inventory\.class|inventory/Slot\.class|AbstractContainer|ItemSlot|Selectable' | awk '{print $4}'
-              for c in \
-                net.minecraft.world.entity.player.Inventory \
-                net.minecraft.world.inventory.InventoryMenu \
-                net.minecraft.world.inventory.AbstractContainerMenu \
-                net.minecraft.world.inventory.Slot \
-                net.minecraft.client.gui.screens.inventory.InventoryScreen \
-                net.minecraft.client.gui.screens.inventory.AbstractContainerScreen \
-                net.minecraft.client.gui.Gui \
-                net.minecraft.world.entity.player.Player; do
-                echo "===== $c"
-                javap -p -cp "$JAR" "$c" 2>&1 || true
-              done
-            fi
+            echo "Classpath: $CP"
+            echo "===== class names"
+            for j in ${CP//:/ }; do
+              unzip -l "$j" | grep -i -E 'Hotbar|/Gui\.class|gui/contextualbar|InventoryScreen|AbstractContainerScreen|KeyEvent' | awk '{print $4}'
+            done
+            dump net.minecraft.client.gui.screens.inventory.AbstractContainerScreen
+            dump net.minecraft.client.gui.screens.inventory.InventoryScreen
+            dump net.minecraft.client.gui.Gui
+            dump net.minecraft.client.input.KeyEvent
+            dumpf net.minecraft.client.KeyMapping 'matches|isDown|consumeClick'
+            dump net.minecraft.world.level.storage.ValueOutput
+            dump net.minecraft.world.level.storage.ValueInput
+            dump net.minecraft.world.inventory.DataSlot
+            dump net.minecraft.world.inventory.ContainerInput
+            dumpf net.minecraft.server.level.ServerPlayer 'restoreFrom|inventoryMenu|containerMenu'
+            dumpf net.minecraft.world.entity.player.Player 'inventoryMenu|getInventory'
           } 2>&1 | tee signatures.txt
 
       - name: Upload signatures
