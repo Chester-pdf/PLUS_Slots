@@ -426,6 +426,46 @@ jobs:
       - name: Build
         run: gradle build --stacktrace
 
+      # Диагностика для этапа 2: выводит реальные сигнатуры классов инвентаря Minecraft 26.2,
+      # чтобы миксины писались по фактам, а не наугад. Результат: артефакт "signatures" и лог шага.
+      - name: Dump Minecraft class signatures
+        if: always()
+        run: |
+          JAR=""
+          for j in $(find "$HOME/.gradle" "$GITHUB_WORKSPACE/.gradle" -name '*.jar' -size +5M 2>/dev/null); do
+            if unzip -l "$j" 2>/dev/null | grep -q 'net/minecraft/world/entity/player/Inventory.class'; then
+              JAR="$j"
+              break
+            fi
+          done
+          {
+            echo "Minecraft jar: $JAR"
+            if [ -n "$JAR" ]; then
+              echo "===== classes (names)"
+              unzip -l "$JAR" | grep -i -E 'Hotbar|InventoryMenu|InventoryScreen|player/Inventory\.class|inventory/Slot\.class|AbstractContainer|ItemSlot|Selectable' | awk '{print $4}'
+              for c in \
+                net.minecraft.world.entity.player.Inventory \
+                net.minecraft.world.inventory.InventoryMenu \
+                net.minecraft.world.inventory.AbstractContainerMenu \
+                net.minecraft.world.inventory.Slot \
+                net.minecraft.client.gui.screens.inventory.InventoryScreen \
+                net.minecraft.client.gui.screens.inventory.AbstractContainerScreen \
+                net.minecraft.client.gui.Gui \
+                net.minecraft.world.entity.player.Player; do
+                echo "===== $c"
+                javap -p -cp "$JAR" "$c" 2>&1 || true
+              done
+            fi
+          } 2>&1 | tee signatures.txt
+
+      - name: Upload signatures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signatures
+          path: signatures.txt
+          if-no-files-found: ignore
+
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
